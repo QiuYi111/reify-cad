@@ -34,6 +34,7 @@ from OCP.BRepLib import BRepLib
 from OCP.BRepLProp import BRepLProp_SLProps
 from OCP.BRepOffsetAPI import (
     BRepOffsetAPI_DraftAngle,
+    BRepOffsetAPI_MakeEvolved,
     BRepOffsetAPI_MakeOffsetShape,
     BRepOffsetAPI_MakePipeShell,
     BRepOffsetAPI_MakeThickSolid,
@@ -42,10 +43,11 @@ from OCP.BRepOffsetAPI import (
 from OCP.BRepPrimAPI import BRepPrimAPI_MakeCone, BRepPrimAPI_MakePrism, BRepPrimAPI_MakeRevol
 from OCP.collections import List_TopoDS_Shape
 from OCP.Geom import Geom_OffsetSurface
-from OCP.GeomAbs import GeomAbs_Cone, GeomAbs_Cylinder, GeomAbs_Plane
-from OCP.gp import gp_Ax1, gp_Ax2, gp_Dir, gp_Pln, gp_Pnt, gp_Trsf, gp_Vec
+from OCP.GeomAbs import GeomAbs_Arc, GeomAbs_Cone, GeomAbs_Cylinder, GeomAbs_Plane
+from OCP.gp import gp_Ax1, gp_Ax2, gp_Ax3, gp_Dir, gp_Pln, gp_Pnt, gp_Trsf, gp_Vec
 from OCP.GProp import GProp_GProps
 from OCP.IFSelect import IFSelect_RetDone
+from OCP.ShapeFix import ShapeFix_Shape
 from OCP.STEPControl import STEPControl_AsIs, STEPControl_Reader, STEPControl_Writer
 from OCP.TopAbs import TopAbs_FACE, TopAbs_SHELL
 from OCP.TopExp import TopExp_Explorer
@@ -78,6 +80,47 @@ from reify.features import (
 from reify.nurbs import BSplineSurfaceShell, LoftSketches, SweepAlongSpline
 from reify.sketch import Sketch2D
 from reify.types import FailReason, Status, VerificationReport
+
+
+def _supports_mat2d_evolved(sketch: Any) -> bool:
+    from reify.sketch import Arc2D, LineSeg2D
+
+    if getattr(sketch, "holes", None):
+        return False
+    return all(isinstance(seg, (LineSeg2D, Arc2D)) for seg in sketch.outer.segments)
+
+
+def _fix_shape_if_needed(shp: TopoDS_Shape) -> TopoDS_Shape:
+    if BRepCheck_Analyzer(shp).IsValid():
+        return shp
+    fixer = ShapeFix_Shape(shp)
+    fixer.Perform()
+    fixed = fixer.Shape()
+    return fixed if not fixed.IsNull() else shp
+
+
+def _compile_evolved_tapered(
+    sketch: Any,
+    h: float,
+    ang_deg: float,
+    z_bot: float,
+    extra_inset: float = 0.0,
+) -> TopoDS_Shape:
+    """Compile drafted solid using OCCT MAT2d BRepOffsetAPI_MakeEvolved (handles vanishing fillets cleanly)."""
+    ang_rad = math.radians(ang_deg)
+    inset = h * math.tan(ang_rad)
+    face_z0 = sketch.to_occt_face(z=0.0)
+    p0 = gp_Pnt(0.0, extra_inset, 0.0)
+    p1 = gp_Pnt(0.0, extra_inset + inset, h)
+    prof = BRepBuilderAPI_MakeWire(BRepBuilderAPI_MakeEdge(p0, p1).Edge()).Wire()
+    ev = BRepOffsetAPI_MakeEvolved(face_z0, prof, GeomAbs_Arc, True, True, True, 1e-4)
+    ev.Build()
+    if not ev.IsDone() or ev.Shape().IsNull():
+        raise RuntimeError("OCCT BRepOffsetAPI_MakeEvolved failed for TaperedExtrude")
+    tr = gp_Trsf()
+    tr.SetTranslation(gp_Vec(0.0, 0.0, z_bot))
+    shp = BRepBuilderAPI_Transform(ev.Shape(), tr, True).Shape()
+    return _fix_shape_if_needed(shp)
 
 
 def _compile_b123d(node: Node, params: dict[str, Any] | None = None):
@@ -122,15 +165,23 @@ def _compile_b123d(node: Node, params: dict[str, Any] | None = None):
     if isinstance(node, TaperedExtrude):
         node.check_degeneracy(params)
         h = _val_mm_float(node.height, params)
-        ang_rad = math.radians(_val_deg_float(node.draft_angle, params))
+        ang_deg = _val_deg_float(node.draft_angle, params)
+        ang_rad = math.radians(ang_deg)
+        if abs(ang_rad) <= 1e-9:
+            face = node.sketch.to_occt_face(params=params, z=-0.5 * h)
+            prism_op = BRepPrimAPI_MakePrism(face, gp_Vec(0.0, 0.0, h))
+            prism_op.Build()
+            if not prism_op.IsDone() or prism_op.Shape().IsNull():
+                raise RuntimeError("OCCT prism failed for TaperedExtrude")
+            return BShape(prism_op.Shape())
+        if _supports_mat2d_evolved(node.sketch):
+            return BShape(_compile_evolved_tapered(node.sketch, h, ang_deg, -0.5 * h, 0.0))
         face = node.sketch.to_occt_face(params=params, z=-0.5 * h)
         prism_op = BRepPrimAPI_MakePrism(face, gp_Vec(0.0, 0.0, h))
         prism_op.Build()
         if not prism_op.IsDone() or prism_op.Shape().IsNull():
             raise RuntimeError("OCCT prism failed for TaperedExtrude")
         prism = prism_op.Shape()
-        if abs(ang_rad) <= 1e-9:
-            return BShape(prism)
         draft = BRepOffsetAPI_DraftAngle(prism)
         pull_dir = gp_Dir(0.0, 0.0, 1.0)
         neutral = gp_Pln(gp_Pnt(0.0, 0.0, -0.5 * h), pull_dir)
@@ -189,7 +240,27 @@ def _compile_b123d(node: Node, params: dict[str, Any] | None = None):
         return BShape(op.Shape())
 
     if isinstance(node, Shell):
+        node.check_degeneracy(params)
         t = _val_mm_float(node.thickness, params)
+        if node.open_top and isinstance(node.child, TaperedExtrude) and _supports_mat2d_evolved(node.child.sketch):
+            h_c = _val_mm_float(node.child.height, params)
+            ang_deg = _val_deg_float(node.child.draft_angle, params)
+            ang_rad = math.radians(ang_deg)
+            if abs(ang_rad) > 1e-9:
+                outer = _compile_evolved_tapered(node.child.sketch, h_c, ang_deg, -0.5 * h_c, 0.0)
+                inner_base_inset = t * math.tan(ang_rad) + t / math.cos(ang_rad)
+                inner = _compile_evolved_tapered(
+                    node.child.sketch,
+                    h_c - t + 1.0,
+                    ang_deg,
+                    -0.5 * h_c + t,
+                    inner_base_inset,
+                )
+                cut = BRepAlgoAPI_Cut(outer, inner)
+                cut.Build()
+                if not cut.IsDone() or cut.Shape().IsNull():
+                    raise RuntimeError("OCCT MakeEvolved open-top Shell cut failed")
+                return BShape(_fix_shape_if_needed(cut.Shape()))
         child_shp = _compile_b123d(node.child, params).wrapped
         if not node.open_top:
             op = BRepOffsetAPI_MakeOffsetShape()
@@ -275,7 +346,10 @@ def _compile_b123d(node: Node, params: dict[str, Any] | None = None):
         if isinstance(node.profile, Sketch2D):
             prof_wire_xy = node.profile.outer.to_occt_wire(params=params, z=0.0)
             tr = gp_Trsf()
-            tr.SetTransformation(gp_Ax2(p0, d_t, d_n), gp_Ax2(gp_Pnt(0.0, 0.0, 0.0), gp_Dir(0.0, 0.0, 1.0), gp_Dir(1.0, 0.0, 0.0)))
+            tr.SetDisplacement(
+                gp_Ax3(gp_Pnt(0.0, 0.0, 0.0), gp_Dir(0.0, 0.0, 1.0), gp_Dir(1.0, 0.0, 0.0)),
+                gp_Ax3(p0, d_t, d_n),
+            )
             prof_wire = TopoDS.Wire(BRepBuilderAPI_Transform(prof_wire_xy, tr, True).Shape())
         else:
             from OCP.gp import gp_Circ
@@ -386,17 +460,33 @@ def _compile_b123d(node: Node, params: dict[str, Any] | None = None):
     raise TypeError(f"Node {type(node).__name__} is not B-Rep exportable")
 
 
+_LAST_COMPILE_ERROR: str | None = None
+
+
+def compile_brep_error() -> str | None:
+    """Return the last exception/validation message from compile_brep()."""
+    return _LAST_COMPILE_ERROR
+
+
 def compile_brep(
     node: Node | Part, params: dict[str, Any] | None = None
 ) -> tuple[Status, TopoDS_Shape | None]:
-    """Compile a standard AST to an OCCT TopoDS_Shape, or return OUT_OF_DOMAIN."""
+    """Compile a standard AST to a BRepCheck-validated OCCT TopoDS_Shape, or return OUT_OF_DOMAIN / FAIL."""
+    global _LAST_COMPILE_ERROR
+    _LAST_COMPILE_ERROR = None
     root = node.root if isinstance(node, Part) else node
     if not root.is_brep_exportable():
+        _LAST_COMPILE_ERROR = "AST contains non-B-Rep-exportable implicit nodes."
         return Status.OUT_OF_DOMAIN, None
     try:
         shape_obj = _compile_b123d(root, params)
-        return Status.PASS, shape_obj.wrapped
-    except Exception:
+        shp = _fix_shape_if_needed(shape_obj.wrapped)
+        if not BRepCheck_Analyzer(shp).IsValid():
+            _LAST_COMPILE_ERROR = "Compiled OCCT B-Rep failed BRepCheck_Analyzer topology validation."
+            return Status.FAIL, None
+        return Status.PASS, shp
+    except Exception as exc:
+        _LAST_COMPILE_ERROR = f"{type(exc).__name__}: {exc}"
         return Status.FAIL, None
 
 

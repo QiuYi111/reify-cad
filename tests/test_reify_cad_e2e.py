@@ -71,3 +71,32 @@ def test_reify_cad_closed_loop_e2e(tmp_path: pathlib.Path) -> None:
     # 6. `reify inspect`
     insp = _run(["inspect", doc_id])
     assert "drafted_enclosure" in insp.stdout
+
+
+def test_reify_cad_pure_sdf_implicit_loop(tmp_path: pathlib.Path) -> None:
+    """Verify SmoothUnion (non-B-Rep implicit) works end-to-end in run/snapshot/export .glb/.stl."""
+    script = tmp_path / "smooth_part.py"
+    script.write_text(
+        "from reify import Box, SmoothUnion, Sphere, Transform, mm\n"
+        "from reify.cad_bridge import reify_model\n\n"
+        "@reify_model(name='smooth_part')\n"
+        "def build():\n"
+        "    return SmoothUnion(Box(mm(16), mm(16), mm(16)), Transform(Sphere(mm(9)), translation=(mm(8), mm(0), mm(0))), k=mm(3))\n\n"
+        "if __name__ == '__main__':\n"
+        "    build()\n",
+        encoding="utf-8",
+    )
+    run_res = _run(["run", str(script)])
+    m_id = re.search(r"id:\s+([0-9a-f-]+)", run_res.stdout)
+    assert m_id, run_res.stdout
+    doc_id = m_id.group(1)
+
+    png_out = tmp_path / "smooth.png"
+    _run(["snapshot", doc_id, str(png_out)])
+    assert png_out.exists() and png_out.stat().st_size > 1000
+
+    glb_out = tmp_path / "smooth.glb"
+    stl_out = tmp_path / "smooth.stl"
+    _run(["export", doc_id, str(glb_out), str(stl_out)])
+    assert glb_out.exists() and glb_out.stat().st_size > 500
+    assert stl_out.exists() and stl_out.stat().st_size > 500

@@ -326,6 +326,29 @@ class Shell(Node):
     def ast_depth(self) -> int:
         return 1 + self.child.ast_depth()
 
+    def check_degeneracy(self, params: dict[str, Any] | None = None) -> None:
+        t = _val_mm_float(self.thickness, params)
+        if t <= 0.0:
+            raise OutOfDomainError(f"Shell {self.node_id}: thickness={t} must be > 0")
+        bmin, bmax = self.child.local_bounds(params)
+        h = bmax[2] - bmin[2]
+        min_h = t if self.open_top else 2.0 * t
+        if min_h >= h - 1e-4:
+            raise OutOfDomainError(
+                f"Shell {self.node_id}: thickness={t:.4f} mm exceeds child height={h:.4f} mm"
+            )
+        if isinstance(self.child, TaperedExtrude):
+            self.child.check_degeneracy(params)
+            bmin2, bmax2 = self.child.sketch.bounds_2d(params)
+            half_span = 0.5 * min(bmax2[0] - bmin2[0], bmax2[1] - bmin2[1])
+            ang_rad = math.radians(_val_deg_float(self.child.draft_angle, params))
+            h_c = _val_mm_float(self.child.height, params)
+            total_top_inset = h_c * math.tan(ang_rad) + t / math.cos(ang_rad)
+            if total_top_inset >= half_span - 1e-4:
+                raise OutOfDomainError(
+                    f"Shell {self.node_id}: drafted wall breakthrough at top (inset+wall={total_top_inset:.4f} >= half_span={half_span:.4f})"
+                )
+
     def find_node(self, node_id: str) -> Node | None:
         if self.node_id == node_id:
             return self

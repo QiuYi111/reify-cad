@@ -1,4 +1,4 @@
-"""Reify primary-path CLI wrapping text-to-cad server/renderer/exporter + Reify certify/autosize."""
+"""Reify primary-path CLI: 100% pure-SDF hot loop + hardened STEP export boundary."""
 
 from __future__ import annotations
 
@@ -6,17 +6,22 @@ import argparse
 import importlib.util
 import json
 import pathlib
+import shutil
 import subprocess
 import sys
 from typing import Any
 
+import trimesh
+
 from reify.ast import Node, Part
+from reify.brep_compiler import compile_brep_error, export_step
 from reify.cad_bridge import (
-    build_violation_overlay,
     get_certification_tier,
-    to_build123d_shape,
+    lookup_reify_document,
+    register_sdf_document,
 )
-from reify.finalize import BRepFinalized, verify_brep_clearance
+from reify.finalize import BRepFinalized, export_finalized_step, verify_brep_clearance
+from reify.sdf_mesh import export_sdf_glb, export_violation_overlay_glb, extract_sdf_mesh
 from reify.solve import SolveStatus, solve
 from reify.spec import Spec
 from reify.types import CertificationTier, Status
@@ -54,7 +59,6 @@ def _extract_target(mod: Any, target_name: str | None) -> Any:
     if target_name is not None:
         obj = getattr(mod, target_name)
     else:
-        # Look for @reify_model first, then build_part / PART / first callable Model
         obj = None
         for attr in dir(mod):
             val = getattr(mod, attr)
@@ -98,7 +102,7 @@ def _extract_params_list(mod: Any, var_name: str | None) -> list[Any]:
     raise RuntimeError("No params_list found; define PARAMS / build_params() or pass --params-list NAME")
 
 
-def _snapshot_views(doc_id: str, out_dir: pathlib.Path) -> list[str]:
+def _snapshot_glb_views(glb_path: pathlib.Path, out_dir: pathlib.Path) -> list[str]:
     out_dir.mkdir(parents=True, exist_ok=True)
     views = [
         ("iso.png", []),
@@ -109,10 +113,128 @@ def _snapshot_views(doc_id: str, out_dir: pathlib.Path) -> list[str]:
     written = []
     for fname, extra in views:
         out_p = out_dir / fname
-        rc = _run_cad_quiet(["model", "snapshot", doc_id, str(out_p), *extra])
+        rc = _run_cad_quiet(["glb", "snapshot", str(glb_path), str(out_p), *extra])
         if rc == 0 and out_p.exists():
             written.append(str(out_p))
     return written
+
+
+def _cmd_run(argv: list[str]) -> int:
+    if not argv or argv[0] in ("-h", "--help"):
+        print("usage: reify run <script.py>")
+        return 0
+    script = pathlib.Path(argv[0]).resolve()
+    proc = subprocess.run([sys.executable, str(script), *argv[1:]], capture_output=True, text=True)
+    if proc.stdout:
+        print(proc.stdout, end="")
+    if proc.stderr:
+        print(proc.stderr, end="", file=sys.stderr)
+    if proc.returncode != 0:
+        return proc.returncode
+    # If script had no __main__ calling @reify_model, register build_part() automatically
+    if "id:" not in proc.stdout:
+        mod = _load_script_module(script)
+        obj = _extract_target(mod, None)
+        doc = register_sdf_document(obj, name=script.stem, script_path=script)
+        print(f"id: {doc.id}")
+        print(f"view: {doc.url}")
+    return 0
+
+
+def _cmd_snapshot(argv: list[str]) -> int:
+    if len(argv) >= 2:
+        src = argv[0]
+        if src.endswith(".glb") and pathlib.Path(src).exists():
+            return _forward_cad(["glb", "snapshot", *argv])
+        entry = lookup_reify_document(src)
+        if entry is not None:
+            return _forward_cad(["glb", "snapshot", entry["glb"], *argv[1:]])
+    return _forward_cad(["model", "snapshot", *argv])
+
+
+def _cmd_inspect(argv: list[str]) -> int:
+    if argv:
+        src = argv[0]
+        entry = lookup_reify_document(src)
+        if entry is not None:
+            print(json.dumps({"id": src, **entry}, indent=2))
+            return _forward_cad(["glb", "inspect", entry["glb"]])
+        if src.endswith(".glb") and pathlib.Path(src).exists():
+            return _forward_cad(["glb", "inspect", *argv])
+    return _forward_cad(["model", "inspect", *argv])
+
+
+def _cmd_export(argv: list[str]) -> int:
+    if len(argv) < 2:
+        print("usage: reify export <id> <out1> [out2 ...]", file=sys.stderr)
+        return 2
+    src, outs = argv[0], argv[1:]
+    entry = lookup_reify_document(src)
+    if entry is None:
+        return _forward_cad(["model", "export", *argv])
+
+    glb_path = pathlib.Path(entry["glb"])
+    mesh_outs = [o for o in outs if pathlib.Path(o).suffix.lower() in (".glb", ".stl", ".3mf")]
+    step_outs = [o for o in outs if pathlib.Path(o).suffix.lower() in (".step", ".stp")]
+    other_outs = [o for o in outs if o not in mesh_outs and o not in step_outs]
+
+    if other_outs:
+        print(f"Unsupported Reify export format(s): {other_outs}", file=sys.stderr)
+        return 2
+
+    obj: Any = None
+    params: dict[str, Any] | None = entry.get("params")
+    if mesh_outs:
+        for dst in mesh_outs:
+            dst_p = pathlib.Path(dst)
+            dst_p.parent.mkdir(parents=True, exist_ok=True)
+            ext = dst_p.suffix.lower()
+            if ext == ".glb":
+                shutil.copy2(glb_path, dst_p)
+                print(f"wrote {dst_p} ({dst_p.stat().st_size} bytes)")
+            else:
+                # Extract watertight unsplit mesh for STL/3MF when script is available, else cad glb export
+                if entry.get("script") and pathlib.Path(entry["script"]).exists():
+                    if obj is None:
+                        mod = _load_script_module(pathlib.Path(entry["script"]))
+                        obj = _extract_target(mod, entry.get("target"))
+                    if isinstance(obj, dict):
+                        meshes = [extract_sdf_mesh(v, params=params, split_creases=False) for v in obj.values()]
+                        combined = trimesh.util.concatenate(meshes)
+                        combined.export(str(dst_p))
+                    else:
+                        m = extract_sdf_mesh(obj, params=params, split_creases=False)
+                        m.export(str(dst_p))
+                    print(f"wrote {dst_p} ({dst_p.stat().st_size} bytes)")
+                else:
+                    rc = _forward_cad(["glb", "export", str(glb_path), str(dst_p)])
+                    if rc != 0:
+                        return rc
+
+    if step_outs:
+        if not entry.get("script") or not pathlib.Path(entry["script"]).exists():
+            print("STEP export requires source Reify script recorded in document.", file=sys.stderr)
+            return 2
+        if obj is None:
+            mod = _load_script_module(pathlib.Path(entry["script"]))
+            obj = _extract_target(mod, entry.get("target"))
+        for dst in step_outs:
+            dst_p = pathlib.Path(dst)
+            if isinstance(obj, BRepFinalized):
+                rep = export_finalized_step(obj, dst_p)
+            elif isinstance(obj, dict):
+                print("STEP export of multi-part dict requires a single Part/Node root.", file=sys.stderr)
+                return 2
+            else:
+                rep = export_step(obj, dst_p, params=params)
+            if rep.status != Status.PASS:
+                err_detail = compile_brep_error()
+                msg = rep.message + (f" ({err_detail})" if err_detail else "")
+                print(f"STEP export failed ({rep.status.value}): {msg}", file=sys.stderr)
+                return 1
+            print(f"wrote {dst_p} ({dst_p.stat().st_size} bytes, BRepCheck=PASS)")
+
+    return 0
 
 
 def _cmd_certify(argv: list[str]) -> int:
@@ -160,18 +282,17 @@ def _cmd_certify(argv: list[str]) -> int:
     rep = verify(obj, spec_obj, params=params)
     snapshots: list[str] = []
     if ns.snapshot_dir is not None:
-        from cad.engine.model import model as cad_handover
-
         ns.snapshot_dir.mkdir(parents=True, exist_ok=True)
         if rep.status != Status.PASS:
-            handle = build_violation_overlay(obj, spec_obj, rep, params=params, name=f"{ns.script.stem}_violation")
-            ov_path = ns.snapshot_dir / "violation_overlay.png"
-            if _run_cad_quiet(["model", "snapshot", handle.id, str(ov_path)]) == 0 and ov_path.exists():
-                snapshots.append(str(ov_path))
+            ov_glb = ns.snapshot_dir / "violation_overlay.glb"
+            ov_png = ns.snapshot_dir / "violation_overlay.png"
+            export_violation_overlay_glb(obj, spec_obj, rep, ov_glb, params=params)
+            if _run_cad_quiet(["glb", "snapshot", str(ov_glb), str(ov_png)]) == 0 and ov_png.exists():
+                snapshots.append(str(ov_png))
         else:
-            shp = to_build123d_shape(obj, params=params, label=ns.script.stem)
-            handle = cad_handover(shp, name=f"{ns.script.stem}_certified")
-            snapshots.extend(_snapshot_views(handle.id, ns.snapshot_dir))
+            cert_glb = ns.snapshot_dir / "certified.glb"
+            export_sdf_glb(obj, cert_glb, params=params)
+            snapshots.extend(_snapshot_glb_views(cert_glb, ns.snapshot_dir))
 
     out = {
         "status": rep.status.value,
@@ -197,7 +318,8 @@ def _cmd_autosize(argv: list[str]) -> int:
     ap.add_argument("--steps", type=int, default=60)
     ns = ap.parse_args(argv)
 
-    mod = _load_script_module(ns.script.resolve())
+    script_resolved = ns.script.resolve()
+    mod = _load_script_module(script_resolved)
     obj = _extract_target(mod, ns.target)
     spec_obj = _extract_spec(mod, ns.spec)
     params_list = _extract_params_list(mod, ns.params_list)
@@ -213,14 +335,17 @@ def _cmd_autosize(argv: list[str]) -> int:
     view_url = None
     snapshots: list[str] = []
     if res.status == SolveStatus.FEASIBLE_FOUND:
-        from cad.engine.model import model as cad_handover
-
-        shp = to_build123d_shape(obj, params=res.params, label=f"{ns.script.stem}_solved")
-        handle = cad_handover(shp, name=f"{ns.script.stem}_solved")
-        doc_id = handle.id
-        view_url = handle.url
+        doc = register_sdf_document(
+            obj,
+            name=f"{ns.script.stem}_solved",
+            script_path=script_resolved,
+            target=ns.target,
+            params=res.params,
+        )
+        doc_id = doc.id
+        view_url = doc.url
         if ns.snapshot_dir is not None:
-            snapshots = _snapshot_views(doc_id, ns.snapshot_dir)
+            snapshots = _snapshot_glb_views(doc.glb_path, ns.snapshot_dir)
 
     out = {
         "status": res.status.value,
@@ -240,13 +365,13 @@ def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if not args or args[0] in ("-h", "--help"):
         print(
-            "Reify-CAD (Primary Certified Parametric CAD CLI)\n\n"
-            "Primary commands:\n"
+            "Reify-CAD (Pure-SDF Primary Certified Parametric CAD CLI)\n\n"
+            "Primary commands (pure-SDF hot loop):\n"
             "  reify server <start|status|stop>\n"
             "  reify run <script.py>\n"
             "  reify snapshot <id> <out.png> [flags...]\n"
             "  reify inspect <id> [ref]\n"
-            "  reify export <id> <out1> [out2...]\n"
+            "  reify export <id> <out1> [out2...]   (.glb/.stl/.3mf via SDF, .step via verified B-Rep)\n"
             "  reify certify <script.py> [--snapshot-dir DIR]\n"
             "  reify autosize <script.py> [--snapshot-dir DIR]\n\n"
             "Secondary compatibility fallback:\n"
@@ -263,12 +388,13 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "server":
         return _forward_cad([cmd, *rest])
     if cmd == "run":
-        if not rest:
-            return _forward_cad([cmd, *rest])
-        proc = subprocess.run([sys.executable, *rest])
-        return proc.returncode
-    if cmd in ("inspect", "snapshot", "export"):
-        return _forward_cad(["model", cmd, *rest])
+        return _cmd_run(rest)
+    if cmd == "snapshot":
+        return _cmd_snapshot(rest)
+    if cmd == "inspect":
+        return _cmd_inspect(rest)
+    if cmd == "export":
+        return _cmd_export(rest)
     if cmd == "certify":
         return _cmd_certify(rest)
     if cmd == "autosize":

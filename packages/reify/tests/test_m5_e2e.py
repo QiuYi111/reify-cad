@@ -106,3 +106,35 @@ def test_m5_solve_draft_and_thickness_and_patterns(tmp_path: pathlib.Path) -> No
     ])
     rep2 = export_step(combo, tmp_path / "m5_combo.step", hausdorff_tol_mm=0.05)
     assert rep2.status == Status.PASS, rep2.message
+
+
+def test_m5_large_draft_shell_19_89_deg_sdf_and_step(tmp_path: pathlib.Path) -> None:
+    """Session 528bdce7 regression: vanishing fillet at 19.89° must be watertight in SDF AND valid in STEP."""
+    from reify.sdf_mesh import extract_sdf_mesh
+    from reify.types import OutOfDomainError
+    import pytest
+
+    body = TaperedExtrude(
+        Sketch2D(Loop2D.rounded_rect(mm(46.0), mm(40.0), mm(7.0))),
+        height=mm(20.0),
+        draft_angle=deg(19.89),
+    )
+    enclosure = Shell(body, thickness=mm(2.5), open_top=True)
+
+    # Pure-SDF Dual Contouring mesh must be watertight
+    mesh = extract_sdf_mesh(enclosure, resolution=84, split_creases=False)
+    assert mesh.is_watertight
+    assert mesh.volume > 5000.0
+
+    # MAT2d MakeEvolved STEP export must pass BRepCheck_Analyzer & Hausdorff < 0.01 mm
+    rep = export_step(enclosure, tmp_path / "enclosure_19_89.step", hausdorff_tol_mm=0.01)
+    assert rep.status == Status.PASS, rep.message
+
+    # Wall breakthrough degeneracy must raise OutOfDomainError
+    bad = Shell(
+        TaperedExtrude(Sketch2D(Loop2D.rounded_rect(mm(20.0), mm(20.0), mm(3.0))), height=mm(20.0), draft_angle=deg(30.0)),
+        thickness=mm(3.0),
+        open_top=True,
+    )
+    with pytest.raises(OutOfDomainError):
+        bad.check_degeneracy()

@@ -6,7 +6,10 @@ license: MIT
 
 # Reify Primary CAD Workflow
 
-Reify is the primary CAD path. Write models using **Class 1 (`CORE_CERTIFIED`)** parametric primitives (`Sketch2D`, `ExtrudeSketch`, `TaperedExtrude`, `RevolveSketch`, `Shell`, `Offset`, `LinearPattern`, `CircularPattern`, `SweepAlongSpline`, `LoftSketches`, `BSplineSurfaceShell`, `Param`, `Spec`) decorated with `@reify_model`.
+Reify is the primary CAD path. Write models using **Class 1 (`CORE_CERTIFIED`)** parametric primitives (`Sketch2D`, `ExtrudeSketch`, `TaperedExtrude`, `RevolveSketch`, `Shell`, `Offset`, `LinearPattern`, `CircularPattern`, `SweepAlongSpline`, `LoftSketches`, `BSplineSurfaceShell`, `SmoothUnion`, `Param`, `Spec`) decorated with `@reify_model`.
+
+- **Full API & Coordinate Reference**: Read [references/api.md](references/api.md) before writing models (all solids are **Z-centered at `z = 0`**).
+- **100% Pure-SDF Hot Loop**: `run`, `snapshot`, `certify`, `autosize`, and `.glb`/`.stl`/`.3mf` export run directly on the SDF (zero OCCT B-Rep crashes). Exact OCCT B-Rep compilation + `BRepCheck_Analyzer` validation runs only on demand when exporting `.step`.
 
 ## Standard Closed Loop
 

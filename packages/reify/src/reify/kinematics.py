@@ -27,7 +27,7 @@ from reify.ast import (
     Transform,
     Union,
 )
-from reify.brep_compiler import compile_brep
+from reify.sdf_mesh import extract_sdf_mesh
 from reify.query import GeometryQuery
 from reify.types import FailReason, Status, VerificationReport
 from reify.units import deg, mm
@@ -287,19 +287,30 @@ def check_kinematic_sweep(
             message="Kinematic collision at initial pose s=0.0.",
         )
 
-    # Optional FCL BVH acceleration when both geometries are B-Rep exportable
+    # Optional FCL BVH acceleration directly from pure-SDF mesh (zero OCCT B-Rep)
     fcl_link = None
     fcl_obs = None
-    fcl_deflection = 0.02
-    if use_fcl and link_node.is_brep_exportable() and obstacle_node.is_brep_exportable():
-        s_l, shp_l = compile_brep(link_node)
-        s_o, shp_o = compile_brep(obstacle_node)
-        if s_l == Status.PASS and s_o == Status.PASS and shp_l is not None and shp_o is not None:
-            bvh_l = _brep_to_fcl_bvh(shp_l, deflection=fcl_deflection)
-            bvh_o = _brep_to_fcl_bvh(shp_o, deflection=fcl_deflection)
-            if bvh_l is not None and bvh_o is not None:
-                fcl_link = fcl.CollisionObject(bvh_l, fcl.Transform())
-                fcl_obs = fcl.CollisionObject(bvh_o, fcl.Transform())
+    fcl_deflection = 0.25
+    if use_fcl:
+        m_l = extract_sdf_mesh(link_node, resolution=40, split_creases=False)
+        m_o = extract_sdf_mesh(obstacle_node, resolution=40, split_creases=False)
+        if len(m_l.vertices) > 0 and len(m_l.faces) > 0 and len(m_o.vertices) > 0 and len(m_o.faces) > 0:
+            bvh_l = fcl.BVHModel()
+            bvh_l.beginModel(len(m_l.vertices), len(m_l.faces))
+            bvh_l.addSubModel(m_l.vertices.astype(np.float64), m_l.faces.astype(np.int64))
+            bvh_l.endModel()
+            bvh_o = fcl.BVHModel()
+            bvh_o.beginModel(len(m_o.vertices), len(m_o.faces))
+            bvh_o.addSubModel(m_o.vertices.astype(np.float64), m_o.faces.astype(np.int64))
+            bvh_o.endModel()
+            fcl_link = fcl.CollisionObject(bvh_l, fcl.Transform())
+            fcl_obs = fcl.CollisionObject(bvh_o, fcl.Transform())
+            # Pad chord-sagitta by cell diagonal of resolution=40 SDF mesh
+            bmin_l, bmax_l = link_node.local_bounds()
+            bmin_o, bmax_o = obstacle_node.local_bounds()
+            dx_l = max(bmax_l[i] - bmin_l[i] for i in range(3)) / 40.0
+            dx_o = max(bmax_o[i] - bmin_o[i] for i in range(3)) / 40.0
+            fcl_deflection = max(0.05, 0.5 * (dx_l + dx_o))
 
     def _eval_sep_and_collision(s_val: float) -> tuple[bool, float, list[tuple[float, float, float]]]:
         """Return (is_violation, conservative_sep_lower_mm, witness_points)."""

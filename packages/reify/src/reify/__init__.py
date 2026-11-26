@@ -24,6 +24,7 @@ from reify.ast import (
     Union,
 )
 from reify.brep_compiler import compile_brep, export_step, extract_topology_invariants
+from reify.sdf_mesh import export_sdf_glb, extract_sdf_mesh
 from reify.dfm import (
     brute_force_binary_morphology,
     check_directional_wall_thickness,
@@ -210,7 +211,9 @@ __all__ = [
     "eval_fcm_displacement_2d",
     "export_calculix_inp",
     "export_finalized_step",
+    "export_sdf_glb",
     "export_step",
+    "extract_sdf_mesh",
     "extract_topology_invariants",
     "fcm_solve_elasticity_2d",
     "fcm_solve_modal_2d",

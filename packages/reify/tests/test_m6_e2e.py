@@ -139,3 +139,27 @@ def test_m6_nurbs_shell_bounds_autograd_and_solve(tmp_path: pathlib.Path) -> Non
     assert res.verify_report.status == Status.PASS
     assert res.params["z_mid"] > 7.5
     assert dt < 30.0
+
+
+def test_m6_sweep_along_spline_sketch2d_profile(tmp_path: pathlib.Path) -> None:
+    """Verify SweepAlongSpline with non-circular Sketch2D profile (gp_Ax3 SetDisplacement + SDF mesh)."""
+    from reify.sdf_mesh import extract_sdf_mesh
+
+    path = BSplineCurve3D(
+        control_points=[
+            (mm(0.0), mm(0.0), mm(0.0)),
+            (mm(20.0), mm(0.0), mm(8.0)),
+            (mm(45.0), mm(15.0), mm(20.0)),
+            (mm(70.0), mm(20.0), mm(26.0)),
+        ],
+        degree=3,
+    )
+    prof = Sketch2D(Loop2D.rounded_rect(mm(8.0), mm(5.0), mm(1.2)))
+    arm = SweepAlongSpline(path=path, profile=prof)
+
+    mesh = extract_sdf_mesh(arm, resolution=64, split_creases=False)
+    assert mesh.is_watertight
+    assert len(mesh.faces) > 100
+
+    rep = export_step(arm, tmp_path / "sweep_sketch2d.step", hausdorff_tol_mm=0.2)
+    assert rep.status == Status.PASS, rep.message
