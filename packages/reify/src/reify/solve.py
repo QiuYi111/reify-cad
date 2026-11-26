@@ -19,8 +19,10 @@ from reify.ast import (
     Union,
     _val_deg_float,
     _val_mm_float,
+    _val_mm_tensor,
+    _val_rad_tensor,
 )
-from reify.features import CircularPattern, LinearPattern, Offset, Shell
+from reify.features import CircularPattern, LinearPattern, Offset, Shell, TaperedExtrude
 from reify.query import GeometryQuery
 from reify.spec import Spec
 from reify.types import Status, VerificationReport
@@ -112,6 +114,57 @@ class SmoothBooleanProxy:
         return node.eval_sdf(pts, params=params, dtype=dtype)
 
 
+def _degeneracy_barrier_loss(
+    root: Node,
+    p_dict: dict[str, torch.Tensor],
+    batch_size: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Differentiable barrier keeping TaperedExtrude and Shell(TaperedExtrude) away from wall breakthrough."""
+    loss = torch.zeros(batch_size, dtype=dtype, device=device)
+
+    def _walk(node: Node) -> None:
+        nonlocal loss
+        if isinstance(node, Transform):
+            _walk(node.child)
+        elif isinstance(node, (Union, Intersect)):
+            for ch in node.children:
+                _walk(ch)
+        elif isinstance(node, Subtract):
+            _walk(node.base)
+            _walk(node.tool)
+        elif isinstance(node, SmoothUnion):
+            _walk(node.a)
+            _walk(node.b)
+        elif isinstance(node, (Offset, LinearPattern, CircularPattern)):
+            _walk(node.child)
+        elif isinstance(node, TaperedExtrude):
+            bmin2, bmax2 = node.sketch.bounds_2d(None)
+            half_span = 0.5 * min(bmax2[0] - bmin2[0], bmax2[1] - bmin2[1])
+            h_t = _val_mm_tensor(node.height, p_dict, dtype).to(device=device)
+            th_t = _val_rad_tensor(node.draft_angle, p_dict, dtype).to(device=device)
+            inset = h_t * torch.tan(th_t)
+            viol = torch.relu(inset - (half_span - 0.5))
+            loss = loss + viol * viol
+        elif isinstance(node, Shell):
+            if isinstance(node.child, TaperedExtrude):
+                te = node.child
+                bmin2, bmax2 = te.sketch.bounds_2d(None)
+                half_span = 0.5 * min(bmax2[0] - bmin2[0], bmax2[1] - bmin2[1])
+                h_t = _val_mm_tensor(te.height, p_dict, dtype).to(device=device)
+                th_t = _val_rad_tensor(te.draft_angle, p_dict, dtype).to(device=device)
+                t_w = _val_mm_tensor(node.thickness, p_dict, dtype).to(device=device)
+                total_inset = h_t * torch.tan(th_t) + t_w / torch.cos(th_t).clamp(min=1e-4)
+                viol = torch.relu(total_inset - (half_span - 0.5))
+                loss = loss + viol * viol
+            else:
+                _walk(node.child)
+
+    _walk(root)
+    return loss
+
+
 def _resolve_solve_device(device: str) -> torch.device:
     if device == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -192,8 +245,12 @@ def solve(
     B = int(u_starts.shape[0])
     u = u_starts.clone().detach().requires_grad_(True)
     opt = torch.optim.Adam([u], lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt, T_max=max(1, steps_per_start), eta_min=0.15 * lr
+    )
 
-    stage1_steps = int(0.6 * steps_per_start)
+    stage1_steps = int(0.35 * steps_per_start)
+    stage2_steps = int(0.75 * steps_per_start)
     margin_pad = 0.25
     L_part = gq_part.lipschitz_bound()
 
@@ -201,6 +258,14 @@ def solve(
     final_soft_vec = torch.zeros(B, dtype=torch.float32, device=dev)
 
     for step in range(steps_per_start):
+        # Homotopy / continuation annealing of smooth boolean proxy k_mm
+        if step < stage1_steps:
+            proxy.k_mm = 2.5 * float(proxy_k_mm)
+        elif step < stage2_steps:
+            proxy.k_mm = float(proxy_k_mm)
+        else:
+            proxy.k_mm = max(0.2, 0.25 * float(proxy_k_mm))
+
         opt.zero_grad()
         theta = lows.unsqueeze(0) + u * (highs - lows).unsqueeze(0)  # (B, P)
         p_dict: dict[str, torch.Tensor] = {p.name: theta[:, i] for i, p in enumerate(params_list)}
@@ -210,7 +275,7 @@ def solve(
             n_per_primitive=64, params=p_dict, dtype=torch.float32
         )
 
-        hard_loss = torch.zeros(B, dtype=torch.float32, device=dev)
+        hard_loss = _degeneracy_barrier_loss(root, p_dict, B, torch.float32, dev)
         for q_obs, obs_pts, m_req, L_obs in obs_data:
             f_part_in_obs = q_obs.eval_field(part_pts, dtype=torch.float32) / L_obs  # (B, N_part)
             f_obs_in_part = proxy.eval_field(root, obs_pts, params=p_dict, dtype=torch.float32) / L_part  # (B, N_obs)
@@ -225,11 +290,14 @@ def solve(
 
         if step < stage1_steps:
             total = torch.sum(100.0 * hard_loss + 0.01 * soft_loss)
+        elif step < stage2_steps:
+            total = torch.sum(150.0 * hard_loss + 0.25 * soft_loss)
         else:
             total = torch.sum(200.0 * hard_loss + 1.0 * soft_loss)
 
         total.backward()
         opt.step()
+        scheduler.step()
         with torch.no_grad():
             u.clamp_(0.0, 1.0)
             final_hard_vec = hard_loss.detach()

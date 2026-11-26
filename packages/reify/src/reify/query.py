@@ -18,7 +18,7 @@ from OCP.TopExp import TopExp_Explorer
 from OCP.TopLoc import TopLoc_Location
 from OCP.TopoDS import TopoDS
 
-from reify.affine import eval_affine_box
+from reify.affine import eval_affine_box, eval_affine_form
 from reify.ast import (
     Box,
     Cylinder,
@@ -872,79 +872,268 @@ class GeometryQuery:
         self,
         other: GeometryQuery,
         params: dict[str, Any] | None = None,
-        deflection: float = 1e-5,
+        deflection: float = 1e-4,
     ) -> DistanceResult:
-        """Query separation distance using OCCT BRepExtrema (SOLVER_TOLERANCE with upper bound witness)."""
-        from reify.brep_compiler import compile_brep
+        """Pure-SDF Two-Stage 3D Octree Lagrangian-Affine Branch-and-Bound separation distance."""
+        import heapq
 
-        sa, shape_a = compile_brep(self.root, params=params)
-        sb, shape_b = compile_brep(other.root, params=params)
-        if sa != Status.PASS or sb != Status.PASS or shape_a is None or shape_b is None:
-            return DistanceResult(
-                value=float("nan"),
-                lower_bound=0.0,
-                upper_bound=float("inf"),
-                solver_deflection=None,
-                witness_a=None,
-                witness_b=None,
-                containment=False,
-                guarantee_level=GuaranteeLevel.SOLVER_TOLERANCE,
-                status=Status.OUT_OF_DOMAIN,
-                is_done=False,
-            )
+        def _closest_pair(
+            ba: tuple[tuple[float, float, float], tuple[float, float, float]],
+            bb: tuple[tuple[float, float, float], tuple[float, float, float]],
+        ) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+            pa = [min(max(0.5 * (bb[0][i] + bb[1][i]), ba[0][i]), ba[1][i]) for i in range(3)]
+            pb = [min(max(pa[i], bb[0][i]), bb[1][i]) for i in range(3)]
+            pa = [min(max(pb[i], ba[0][i]), ba[1][i]) for i in range(3)]
+            return (pa[0], pa[1], pa[2]), (pb[0], pb[1], pb[2])
 
-        ext = BRepExtrema_DistShapeShape()
-        ext.LoadS1(shape_a)
-        ext.LoadS2(shape_b)
-        ext.SetDeflection(deflection)
-        ext.Perform()
-        if not ext.IsDone() or ext.NbSolution() == 0:
-            return DistanceResult(
-                value=float("nan"),
-                lower_bound=0.0,
-                upper_bound=float("inf"),
-                solver_deflection=deflection,
-                witness_a=None,
-                witness_b=None,
-                containment=False,
-                guarantee_level=GuaranteeLevel.SOLVER_TOLERANCE,
-                status=Status.UNKNOWN,
-                is_done=False,
-            )
+        def _alt_proj(pa0: torch.Tensor, pb0: torch.Tensor, rounds: int = 8) -> tuple[torch.Tensor, torch.Tensor]:
+            pa, pb = pa0.clone(), pb0.clone()
+            for _ in range(rounds):
+                pa = self._project_to_implicit_surface(pb, params=params, steps=3)
+                pb = other._project_to_implicit_surface(pa, params=params, steps=3)
+            pa = self._project_to_implicit_surface(pb, params=params, steps=4)
+            pb = other._project_to_implicit_surface(pa, params=params, steps=4)
+            return pa, pb
 
-        val = float(ext.Value())
-        pa = ext.PointOnShape1(1)
-        pb = ext.PointOnShape2(1)
-        wa = (float(pa.X()), float(pa.Y()), float(pa.Z()))
-        wb = (float(pb.X()), float(pb.Y()), float(pb.Z()))
-        witness_dist = math.sqrt(sum((wa[i] - wb[i]) ** 2 for i in range(3)))
+        box_a = self.root.local_bounds(params)
+        box_b = other.root.local_bounds(params)
+        L_a = max(1.0, self.lipschitz_bound(params))
+        L_b = max(1.0, other.lipschitz_bound(params))
 
-        # Check containment via solid classifier if val == 0 or inner solution
-        containment = bool(ext.InnerSolution())
-        if val <= deflection:
-            containment = True
-        else:
-            # Check if a point on A is inside B or vice versa
-            for shape_target, pt in [(shape_b, pa), (shape_a, pb)]:
-                exp = TopExp_Explorer(shape_target, TopAbs_SOLID)
-                while exp.More():
-                    clf = BRepClass3d_SolidClassifier(TopoDS.Solid(exp.Current()), pt, 1e-6)
-                    if clf.State() in (TopAbs_IN, TopAbs_ON):
-                        containment = True
+        ma0 = [0.5 * (box_a[0][i] + box_a[1][i]) for i in range(3)]
+        mb0 = [0.5 * (box_b[0][i] + box_b[1][i]) for i in range(3)]
+        cp_a0, cp_b0 = _closest_pair(box_a, box_b)
+
+        # Immediate penetration check at centers
+        ctr_pts = torch.tensor([ma0, mb0], dtype=torch.float64)
+        with torch.no_grad():
+            fa_c0 = self.eval_field(ctr_pts, params=params, dtype=torch.float64)
+            fb_c0 = other.eval_field(ctr_pts, params=params, dtype=torch.float64)
+        for idx, pt in enumerate((ma0, mb0)):
+            if float(fa_c0[idx]) <= 0.0 and float(fb_c0[idx]) <= 0.0:
+                w = (float(pt[0]), float(pt[1]), float(pt[2]))
+                return DistanceResult(
+                    value=0.0,
+                    lower_bound=0.0,
+                    upper_bound=0.0,
+                    solver_deflection=deflection,
+                    witness_a=w,
+                    witness_b=w,
+                    containment=True,
+                    guarantee_level=GuaranteeLevel.SOLVER_TOLERANCE,
+                    status=Status.PASS,
+                    is_done=True,
+                )
+
+        # Multi-start alternating surface projection for tight initial upper bound
+        pa_init = torch.tensor([ma0, mb0, list(cp_a0)], dtype=torch.float64)
+        pb_init = torch.tensor([mb0, ma0, list(cp_b0)], dtype=torch.float64)
+        pa_p, pb_p = _alt_proj(pa_init, pb_init, rounds=8)
+        with torch.no_grad():
+            fa_p = torch.abs(self.eval_field(pa_p, params=params, dtype=torch.float64))
+            fb_p = torch.abs(other.eval_field(pb_p, params=params, dtype=torch.float64))
+            fa_on_b = self.eval_field(pb_p, params=params, dtype=torch.float64)
+            fb_on_a = other.eval_field(pa_p, params=params, dtype=torch.float64)
+
+        best_upper = float("inf")
+        best_wa = (float(ma0[0]), float(ma0[1]), float(ma0[2]))
+        best_wb = (float(mb0[0]), float(mb0[1]), float(mb0[2]))
+        for idx in range(3):
+            if float(fb_on_a[idx]) <= 0.0 and float(fa_p[idx]) <= 1e-4:
+                w = tuple(float(v) for v in pa_p[idx].tolist())
+                return DistanceResult(
+                    value=0.0,
+                    lower_bound=0.0,
+                    upper_bound=0.0,
+                    solver_deflection=deflection,
+                    witness_a=w,  # type: ignore[arg-type]
+                    witness_b=w,  # type: ignore[arg-type]
+                    containment=True,
+                    guarantee_level=GuaranteeLevel.SOLVER_TOLERANCE,
+                    status=Status.PASS,
+                    is_done=True,
+                )
+            if float(fa_on_b[idx]) <= 0.0 and float(fb_p[idx]) <= 1e-4:
+                w = tuple(float(v) for v in pb_p[idx].tolist())
+                return DistanceResult(
+                    value=0.0,
+                    lower_bound=0.0,
+                    upper_bound=0.0,
+                    solver_deflection=deflection,
+                    witness_a=w,  # type: ignore[arg-type]
+                    witness_b=w,  # type: ignore[arg-type]
+                    containment=True,
+                    guarantee_level=GuaranteeLevel.SOLVER_TOLERANCE,
+                    status=Status.PASS,
+                    is_done=True,
+                )
+            if float(fa_p[idx]) < 1e-4 and float(fb_p[idx]) < 1e-4:
+                dc = float(torch.linalg.norm(pa_p[idx] - pb_p[idx]).item())
+                if dc < best_upper:
+                    best_upper = dc
+                    best_wa = tuple(float(v) for v in pa_p[idx].tolist())  # type: ignore[assignment]
+                    best_wb = tuple(float(v) for v in pb_p[idx].tolist())  # type: ignore[assignment]
+
+        pen_witness: tuple[float, float, float] | None = None
+
+        def _bnb_3d(
+            q_own: GeometryQuery,
+            q_other: GeometryQuery,
+            box_own: tuple[tuple[float, float, float], tuple[float, float, float]],
+            L_own: float,
+            L_other: float,
+            max_waves: int = 60,
+            batch_size: int = 32,
+        ) -> tuple[float, bool]:
+            nonlocal best_upper, best_wa, best_wb, pen_witness
+            lo0 = np.array(box_own[0], dtype=np.float64)
+            hi0 = np.array(box_own[1], dtype=np.float64)
+            pq: list[tuple[float, int, np.ndarray, np.ndarray]] = [(0.0, 0, lo0, hi0)]
+            seq = 1
+            waves = 0
+            while pq and waves < max_waves:
+                if pq[0][0] >= best_upper - deflection:
+                    break
+                if float(np.linalg.norm(pq[0][3] - pq[0][2])) < deflection * 0.25:
+                    break
+                waves += 1
+                popped: list[tuple[float, int, np.ndarray, np.ndarray]] = []
+                while pq and len(popped) < batch_size:
+                    item = heapq.heappop(pq)
+                    if item[0] >= best_upper - deflection:
+                        heapq.heappush(pq, item)
                         break
-                    exp.Next()
+                    popped.append(item)
+                if not popped:
+                    break
 
-        eps = max(
-            self.eps_num(params=params, dtype=torch.float64),
-            other.eps_num(params=params, dtype=torch.float64),
+                c_lo_l: list[np.ndarray] = []
+                c_hi_l: list[np.ndarray] = []
+                for _, _, lo, hi in popped:
+                    mid = 0.5 * (lo + hi)
+                    for ox in (0, 1):
+                        for oy in (0, 1):
+                            for oz in (0, 1):
+                                c_lo_l.append(
+                                    np.array([lo[0] if ox == 0 else mid[0], lo[1] if oy == 0 else mid[1], lo[2] if oz == 0 else mid[2]])
+                                )
+                                c_hi_l.append(
+                                    np.array([mid[0] if ox == 0 else hi[0], mid[1] if oy == 0 else hi[1], mid[2] if oz == 0 else hi[2]])
+                                )
+                c_lo = np.stack(c_lo_l, axis=0)
+                c_hi = np.stack(c_hi_l, axis=0)
+                m = 0.5 * (c_lo + c_hi)
+                r = 0.5 * np.linalg.norm(c_hi - c_lo, axis=-1)
+                pts = torch.from_numpy(m)
+                with torch.no_grad():
+                    f_own = q_own.eval_field(pts, params=params, dtype=torch.float64).numpy()
+                    f_oth = q_other.eval_field(pts, params=params, dtype=torch.float64).numpy()
+
+                pen_mask = (f_own <= 0.0) & (f_oth <= 0.0)
+                if np.any(pen_mask):
+                    pi = int(np.nonzero(pen_mask)[0][0])
+                    pen_witness = (float(m[pi, 0]), float(m[pi, 1]), float(m[pi, 2]))
+                    return 0.0, True
+
+                keep = (f_own - L_own * r <= 0.0) & ~((f_own + L_own * r < 0.0) & (f_oth - L_other * r > 0.0))
+                lb_c = np.maximum(0.0, f_oth / L_other - r)
+                keep &= lb_c < best_upper - deflection
+                idxs = np.nonzero(keep)[0]
+                if len(idxs) > 0:
+                    if (waves == 1 and math.isinf(best_upper)) or waves % 3 == 0:
+                        bi = int(idxs[np.argmin(lb_c[idxs])])
+                        seed = torch.tensor([m[bi].tolist()], dtype=torch.float64)
+                        pa_c, pb_c = _alt_proj(seed, seed, rounds=4)
+                        with torch.no_grad():
+                            fac = abs(float(self.eval_field(pa_c, params=params, dtype=torch.float64)[0]))
+                            fbc = abs(float(other.eval_field(pb_c, params=params, dtype=torch.float64)[0]))
+                        if fac < 1e-4 and fbc < 1e-4:
+                            dc = float(torch.linalg.norm(pa_c[0] - pb_c[0]))
+                            if dc < best_upper:
+                                best_upper = dc
+                                best_wa = tuple(float(v) for v in pa_c[0].tolist())  # type: ignore[assignment]
+                                best_wb = tuple(float(v) for v in pb_c[0].tolist())  # type: ignore[assignment]
+
+                    for i in idxs:
+                        clo_t = (float(c_lo[i, 0]), float(c_lo[i, 1]), float(c_lo[i, 2]))
+                        chi_t = (float(c_hi[i, 0]), float(c_hi[i, 1]), float(c_hi[i, 2]))
+                        af_own = eval_affine_form(q_own.root, clo_t, chi_t, params)
+                        lo_own, hi_own = af_own.bounds()
+                        if lo_own > 0.0:
+                            continue
+                        af_oth = eval_affine_form(q_other.root, clo_t, chi_t, params)
+                        lo_oth, _ = af_oth.bounds()
+                        if hi_own < 0.0 and lo_oth > 0.0:
+                            continue
+                        # Certified Lagrangian Affine Cancellation lower bound
+                        denom = float(np.dot(af_own.coeffs, af_own.coeffs))
+                        lam = max(0.0, -float(np.dot(af_oth.coeffs, af_own.coeffs)) / denom) if denom > 1e-18 else 0.0
+                        comb_c = af_oth.center + lam * af_own.center
+                        comb_g = af_oth.coeffs + lam * af_own.coeffs
+                        comb_r = af_oth.radius + lam * af_own.radius
+                        lo_lag = comb_c - float(np.sum(np.abs(comb_g))) - comb_r
+                        lbi = max(float(lb_c[i]), lo_oth / L_other, lo_lag / L_other)
+                        if lbi < best_upper - deflection:
+                            heapq.heappush(pq, (lbi, seq, c_lo[i], c_hi[i]))
+                            seq += 1
+
+            lb_out = pq[0][0] if pq else best_upper
+            return lb_out, False
+
+        lb_b, pen = _bnb_3d(other, self, box_b, L_b, L_a)
+        if pen and pen_witness is not None:
+            return DistanceResult(
+                value=0.0,
+                lower_bound=0.0,
+                upper_bound=0.0,
+                solver_deflection=deflection,
+                witness_a=pen_witness,
+                witness_b=pen_witness,
+                containment=True,
+                guarantee_level=GuaranteeLevel.SOLVER_TOLERANCE,
+                status=Status.PASS,
+                is_done=True,
+            )
+
+        min_lb = lb_b
+        if min_lb < best_upper - deflection:
+            lb_a, pen = _bnb_3d(self, other, box_a, L_a, L_b)
+            if pen and pen_witness is not None:
+                return DistanceResult(
+                    value=0.0,
+                    lower_bound=0.0,
+                    upper_bound=0.0,
+                    solver_deflection=deflection,
+                    witness_a=pen_witness,
+                    witness_b=pen_witness,
+                    containment=True,
+                    guarantee_level=GuaranteeLevel.SOLVER_TOLERANCE,
+                    status=Status.PASS,
+                    is_done=True,
+                )
+            min_lb = max(min_lb, lb_a)
+
+        # Check containment / penetration at witness points
+        wa_t = torch.tensor([list(best_wa)], dtype=torch.float64)
+        wb_t = torch.tensor([list(best_wb)], dtype=torch.float64)
+        containment = (
+            other.classify_point(wa_t, params=params)[0] == PointClass.INSIDE
+            or self.classify_point(wb_t, params=params)[0] == PointClass.INSIDE
+            or best_upper <= deflection
         )
+        if containment:
+            min_lb = 0.0
+            best_upper = 0.0
+
+        eps = max(self.eps_num(params=params, dtype=torch.float64), other.eps_num(params=params, dtype=torch.float64))
+        val = 0.5 * (min_lb + best_upper)
         return DistanceResult(
             value=val,
-            lower_bound=max(0.0, val - deflection - eps),
-            upper_bound=witness_dist + eps,
+            lower_bound=max(0.0, min_lb - eps),
+            upper_bound=best_upper + eps,
             solver_deflection=deflection,
-            witness_a=wa,
-            witness_b=wb,
+            witness_a=best_wa,  # type: ignore[arg-type]
+            witness_b=best_wb,  # type: ignore[arg-type]
             containment=containment,
             guarantee_level=GuaranteeLevel.SOLVER_TOLERANCE,
             status=Status.PASS,

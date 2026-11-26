@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+import torch
 
 from reify.ast import (
     Box,
@@ -104,27 +105,12 @@ class AffineForm:
         )
 
     def square(self) -> AffineForm:
-        lo, hi = self.bounds()
-        if lo >= 0.0:
-            c_min, c_max = lo * lo, hi * hi
-        elif hi <= 0.0:
-            c_min, c_max = hi * hi, lo * lo
-        else:
-            c_min, c_max = 0.0, max(lo * lo, hi * hi)
-        # Use exact interval enclosure centered around affine linear part
         lin_c = self.center * self.center
         lin_coeffs = 2.0 * self.center * self.coeffs
-        lin_r = float(np.sum(np.abs(lin_coeffs)))
-        # Exact residual bound of (c + d)^2 - (c^2 + 2 c d) = d^2 <= r_total^2
         r_total = float(np.sum(np.abs(self.coeffs))) + self.radius
         rem_mid = 0.5 * r_total * r_total
-        # Tighten against true interval bounds if narrower
         new_c = lin_c + rem_mid
         new_r = 2.0 * abs(self.center) * self.radius + rem_mid
-        a_lo = new_c - lin_r - new_r
-        a_hi = new_c + lin_r + new_r
-        if a_lo < c_min or a_hi > c_max:
-            return AffineForm(0.5 * (c_min + c_max), np.zeros(3), 0.5 * (c_max - c_min))
         return AffineForm(new_c, lin_coeffs, new_r)
 
     def clamp_min_zero(self) -> AffineForm:
@@ -189,6 +175,21 @@ def _rot_matrix_np(rx_deg: float, ry_deg: float, rz_deg: float) -> np.ndarray:
     )
 
 
+def eval_affine_form(
+    node: Node,
+    box_min: tuple[float, float, float],
+    box_max: tuple[float, float, float],
+    params: dict[str, Any] | None = None,
+) -> AffineForm:
+    """Conservatively bound node.eval_sdf(x) over [box_min, box_max] as a first-order AffineForm."""
+    c = 0.5 * (np.array(box_min, dtype=np.float64) + np.array(box_max, dtype=np.float64))
+    h = 0.5 * (np.array(box_max, dtype=np.float64) - np.array(box_min, dtype=np.float64))
+    ax = AffineForm(c[0], np.array([h[0], 0.0, 0.0]), 0.0)
+    ay = AffineForm(c[1], np.array([0.0, h[1], 0.0]), 0.0)
+    az = AffineForm(c[2], np.array([0.0, 0.0, h[2]]), 0.0)
+    return _eval_affine_node(node, ax, ay, az, params)
+
+
 def eval_affine_box(
     node: Node,
     box_min: tuple[float, float, float],
@@ -196,13 +197,7 @@ def eval_affine_box(
     params: dict[str, Any] | None = None,
 ) -> tuple[float, float]:
     """Conservatively bound node.eval_sdf(x) over [box_min, box_max] using affine arithmetic."""
-    c = 0.5 * (np.array(box_min, dtype=np.float64) + np.array(box_max, dtype=np.float64))
-    h = 0.5 * (np.array(box_max, dtype=np.float64) - np.array(box_min, dtype=np.float64))
-    ax = AffineForm(c[0], np.array([h[0], 0.0, 0.0]), 0.0)
-    ay = AffineForm(c[1], np.array([0.0, h[1], 0.0]), 0.0)
-    az = AffineForm(c[2], np.array([0.0, 0.0, h[2]]), 0.0)
-    af = _eval_affine_node(node, ax, ay, az, params)
-    return af.bounds()
+    return eval_affine_form(node, box_min, box_max, params).bounds()
 
 
 def _eval_affine_node(
@@ -382,16 +377,22 @@ def _eval_affine_node(
         hi = fc + half_diag
         return AffineForm(0.5 * (lo + hi), np.zeros(3), 0.5 * (hi - lo))
 
-    if isinstance(node, (SmoothUnion, FreeImplicit, Frustum, RevolveSketch, Shell, SweepAlongSpline, LoftSketches)):
-        # Fallback Lipschitz box bound from center
-        cx, cy, cz = x.center, y.center, z.center
-        rx = float(np.sum(np.abs(x.coeffs))) + x.radius
-        ry = float(np.sum(np.abs(y.coeffs))) + y.radius
-        rz = float(np.sum(np.abs(z.coeffs))) + z.radius
-        import torch
+    if isinstance(node, SmoothUnion):
+        fa = _eval_affine_node(node.a, x, y, z, params)
+        fb = _eval_affine_node(node.b, x, y, z, params)
+        k = _val_mm_float(node.k, params)
+        if k <= 1e-12:
+            return AffineForm.minimum(fa, fb)
+        diff = (fa - fb).abs()
+        h = (AffineForm.constant(k) - diff).clamp_min_zero() * (1.0 / k)
+        return AffineForm.minimum(fa, fb) - h.square() * (0.25 * k)
 
-        fc = float(node.eval_sdf(torch.tensor([[cx, cy, cz]], dtype=torch.float64), params=params)[0].item())
-        lip_r = node.lipschitz_bound(params) * math.sqrt(rx * rx + ry * ry + rz * rz)
-        return AffineForm(fc, np.zeros(3), lip_r)
-
-    raise TypeError(f"Unsupported AST node in affine evaluator: {type(node).__name__}")
+    # General Lipschitz box bound fallback (handles Frustum, Shell, LoftSketches,
+    # internal _RigidMatrixNode / _OffsetSolidNode wrappers, and custom Node subclasses)
+    cx, cy, cz = x.center, y.center, z.center
+    rx = float(np.sum(np.abs(x.coeffs))) + x.radius
+    ry = float(np.sum(np.abs(y.coeffs))) + y.radius
+    rz = float(np.sum(np.abs(z.coeffs))) + z.radius
+    fc = float(node.eval_sdf(torch.tensor([[cx, cy, cz]], dtype=torch.float64), params=params)[0].item())
+    lip_r = node.lipschitz_bound(params) * math.sqrt(rx * rx + ry * ry + rz * rz)
+    return AffineForm(fc, np.zeros(3), lip_r)

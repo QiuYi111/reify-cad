@@ -330,31 +330,48 @@ def check_directional_wall_thickness(
             ray_dirs_list.append(-ca * n_np + sa * tang)
 
     n_pts = p_np.shape[0]
-    n_steps = int(math.ceil(max_diag / ray_step_mm)) + 2
-    ts = np.arange(2, n_steps, dtype=np.float64) * ray_step_mm  # skip first 2 steps near start
+    L_part = max(1.0, q.lipschitz_bound(params))
+    min_step = max(0.5 * ray_step_mm, 1e-3)
+    t_init = 2.0 * ray_step_mm
 
     min_valid_thick = float("inf")
     best_pair: list[tuple[float, float, float]] = []
 
     for r_dirs in ray_dirs_list:
-        # March in chunks to keep memory compact
-        pts_march = p_np[:, None, :] + ts[None, :, None] * r_dirs[:, None, :]
-        flat_t = torch.from_numpy(pts_march.reshape(-1, 3)).to(torch.float64)
-        vals = q.eval_field(flat_t, params=params, dtype=torch.float64).detach().cpu().numpy()
-        vals = vals.reshape(n_pts, len(ts))
+        # Lipschitz-safe interior Sphere Tracing (O(N) memory instead of dense ray grid)
+        t_cur = np.full(n_pts, t_init, dtype=np.float64)
+        t_prev = np.full(n_pts, t_init, dtype=np.float64)
+        p0_t = torch.from_numpy(p_np + t_cur[:, None] * r_dirs).to(torch.float64)
+        v0 = q.eval_field(p0_t, params=params, dtype=torch.float64).detach().cpu().numpy()
+        active = v0 < -1e-6
+        exited = np.zeros(n_pts, dtype=bool)
+        t_exit = np.zeros(n_pts, dtype=np.float64)
 
-        # Find first index where point exits interior (vals >= 0) after being inside (vals[:, 0] < 0)
-        started_inside = vals[:, 0] < -1e-6
-        exited = (vals >= 0.0) & started_inside[:, None]
-        has_exit = np.any(exited, axis=1)
-        if not np.any(has_exit):
+        for _ in range(128):
+            idx = np.nonzero(active)[0]
+            if idx.size == 0:
+                break
+            pts_m = torch.from_numpy(p_np[idx] + t_cur[idx, None] * r_dirs[idx]).to(torch.float64)
+            vals_m = q.eval_field(pts_m, params=params, dtype=torch.float64).detach().cpu().numpy()
+            hit_m = vals_m >= 0.0
+            if np.any(hit_m):
+                h_idx = idx[hit_m]
+                exited[h_idx] = True
+                t_exit[h_idx] = t_cur[h_idx]
+                active[h_idx] = False
+            cont = ~hit_m
+            if np.any(cont):
+                c_idx = idx[cont]
+                t_prev[c_idx] = t_cur[c_idx]
+                step = np.maximum(np.abs(vals_m[cont]) / L_part, min_step)
+                t_cur[c_idx] += step
+                active[c_idx] = t_cur[c_idx] <= max_diag
+
+        if not np.any(exited):
             continue
-        first_idx = np.argmax(exited, axis=1)
-        cand_i = np.nonzero(has_exit)[0]
-        j_hit = first_idx[cand_i]
-
-        t_lo = ts[np.maximum(j_hit - 1, 0)]
-        t_hi = ts[j_hit]
+        cand_i = np.nonzero(exited)[0]
+        t_lo = t_prev[cand_i]
+        t_hi = t_exit[cand_i]
         p_sub = p_np[cand_i]
         d_sub = r_dirs[cand_i]
         for _ in range(8):
@@ -466,3 +483,71 @@ def compute_structural_thickness(
         "voxel_error_mm": voxel_err,
         "thickness_field": thick,
     }
+
+
+def check_draft_and_overhang(
+    part_node: Node | Part,
+    pull_dir: tuple[float, float, float] = (0.0, 0.0, 1.0),
+    min_draft_deg: float = 1.0,
+    max_overhang_deg: float = 45.0,
+    sample_radius: float = 0.8,
+    params: dict[str, Any] | None = None,
+) -> VerificationReport:
+    """Pure-SDF analytic surface normal screening for molding draft angle and 3D-printing overhang."""
+    root = part_node.root if isinstance(part_node, Part) else part_node
+    q = GeometryQuery(root)
+    cov = q.cover_surface(max_radius=sample_radius, params=params)
+    if cov.centers.shape[0] == 0:
+        return VerificationReport(status=Status.OUT_OF_DOMAIN, message="Empty surface cover.")
+
+    p_surf = q._project_to_implicit_surface(cov.centers, params=params, steps=8)
+    n_out = _finite_diff_normals(q, p_surf, params).detach().cpu().numpy()
+    p_np = p_surf.detach().cpu().numpy()
+
+    d_vec = np.asarray(pull_dir, dtype=np.float64)
+    d_vec = d_vec / max(float(np.linalg.norm(d_vec)), 1e-12)
+    dots = np.clip(n_out @ d_vec, -1.0, 1.0)
+
+    # Side walls: |dot(n, pull)| < 0.7 -> draft_deg = arcsin(dot(n, pull))
+    side_mask = np.abs(dots) < 0.7
+    draft_angles = np.degrees(np.arcsin(np.abs(dots[side_mask]))) if np.any(side_mask) else np.array([90.0])
+    min_draft_seen = float(np.min(draft_angles))
+
+    # Downward-facing overhang faces: dot(n, pull) < -0.05 (exclude bottom-most base plate if flat on z_min)
+    bmin, _ = root.local_bounds(params)
+    not_floor = (p_np @ d_vec) > (float(np.dot(bmin, d_vec)) + 0.5)
+    down_mask = (dots < -0.05) & not_floor
+    if np.any(down_mask):
+        # Overhang angle from vertical: 0 deg = vertical wall, 90 deg = horizontal ceiling
+        overhang_angles = np.degrees(np.arcsin(np.abs(dots[down_mask])))
+        max_overhang_seen = float(np.max(overhang_angles))
+        bad_ov = overhang_angles > max_overhang_deg
+        ov_frac = float(np.sum(bad_ov) / len(dots))
+        worst_idx = int(np.nonzero(down_mask)[0][int(np.argmax(overhang_angles))])
+    else:
+        max_overhang_seen = 0.0
+        ov_frac = 0.0
+        worst_idx = 0
+
+    metrics = {
+        "min_draft_deg": min_draft_seen,
+        "max_overhang_deg": max_overhang_seen,
+        "overhang_fraction": ov_frac,
+        "n_surface_samples": int(len(dots)),
+    }
+    if min_draft_seen < min_draft_deg or max_overhang_seen > max_overhang_deg:
+        return VerificationReport(
+            status=Status.FAIL,
+            reason=FailReason.DFM_VIOLATION if hasattr(FailReason, "DFM_VIOLATION") else FailReason.WALL_THICKNESS,
+            witness_points=[tuple(float(v) for v in p_np[worst_idx])],  # type: ignore[list-item]
+            metrics=metrics,
+            message=(
+                f"Draft/overhang violation: min_draft={min_draft_seen:.2f}° (req >= {min_draft_deg}°), "
+                f"max_overhang={max_overhang_seen:.2f}° (req <= {max_overhang_deg}°)."
+            ),
+        )
+    return VerificationReport(
+        status=Status.PASS,
+        metrics=metrics,
+        message=f"Draft/overhang PASS (min_draft={min_draft_seen:.2f}°, max_overhang={max_overhang_seen:.2f}°).",
+    )

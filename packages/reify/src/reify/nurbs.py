@@ -972,12 +972,31 @@ class LoftSketches(Node):
         same_topo = all(len(s.outer.segments) == n_segs for s in self.sections)
         n_per_seg = max(4, 48 // n_segs) if same_topo else 16
         rings: list[torch.Tensor] = []
-        for sec, zq in zip(self.sections, self.z_levels):
+        for idx_s, (sec, zq) in enumerate(zip(self.sections, self.z_levels)):
             pts2 = sec.outer.sample_boundary_points(n_per_seg=n_per_seg, params=params, dtype=dtype, device=device)
             if pts2.ndim == 2:
                 if not same_topo:
-                    idx = torch.linspace(0, pts2.shape[0] - 1, 48, dtype=torch.long)
-                    pts2 = pts2[idx]
+                    # Uniform arc-length resampling (64 pts) + minimum-twist cyclic alignment
+                    closed_p = torch.cat([pts2, pts2[:1]], dim=0)
+                    ds = torch.linalg.norm(closed_p[1:] - closed_p[:-1], dim=-1)
+                    s_cum = torch.cat([torch.zeros(1, dtype=dtype, device=device), torch.cumsum(ds, dim=0)])
+                    total_s = s_cum[-1].clamp(min=1e-9)
+                    s_target = torch.linspace(0.0, float(total_s.item()), 65, dtype=dtype, device=device)[:-1]
+                    # Linear interpolation along arc length
+                    seg_idx = torch.clamp(torch.searchsorted(s_cum, s_target, right=True) - 1, 0, len(ds) - 1)
+                    alpha = ((s_target - s_cum[seg_idx]) / ds[seg_idx].clamp(min=1e-12)).unsqueeze(-1)
+                    pts2 = closed_p[seg_idx] * (1.0 - alpha) + closed_p[seg_idx + 1] * alpha
+                    if idx_s > 0:
+                        ref_xy = rings[-1][..., :2]
+                        best_shift = 0
+                        best_d2 = float("inf")
+                        for sh in range(64):
+                            rolled = torch.roll(pts2, sh, dims=0)
+                            d2 = float(torch.sum((rolled - ref_xy) ** 2).item())
+                            if d2 < best_d2:
+                                best_d2 = d2
+                                best_shift = sh
+                        pts2 = torch.roll(pts2, best_shift, dims=0)
                 zv = _val_mm_tensor(zq, params, dtype).to(device=device).expand(pts2.shape[0], 1)
                 rings.append(torch.cat([pts2, zv], dim=-1))
             else:

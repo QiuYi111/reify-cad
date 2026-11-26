@@ -82,12 +82,15 @@ from reify.sketch import Sketch2D
 from reify.types import FailReason, Status, VerificationReport
 
 
-def _supports_mat2d_evolved(sketch: Any) -> bool:
+def _supports_mat2d_evolved(sketch: Any, *, allow_holes: bool = False) -> bool:
     from reify.sketch import Arc2D, LineSeg2D
 
-    if getattr(sketch, "holes", None):
+    holes = getattr(sketch, "holes", None) or []
+    if holes and not allow_holes:
         return False
-    return all(isinstance(seg, (LineSeg2D, Arc2D)) for seg in sketch.outer.segments)
+    if not all(isinstance(seg, (LineSeg2D, Arc2D)) for seg in sketch.outer.segments):
+        return False
+    return all(all(isinstance(seg, (LineSeg2D, Arc2D)) for seg in h.segments) for h in holes)
 
 
 def _fix_shape_if_needed(shp: TopoDS_Shape) -> TopoDS_Shape:
@@ -106,20 +109,40 @@ def _compile_evolved_tapered(
     z_bot: float,
     extra_inset: float = 0.0,
 ) -> TopoDS_Shape:
-    """Compile drafted solid using OCCT MAT2d BRepOffsetAPI_MakeEvolved (handles vanishing fillets cleanly)."""
+    """Compile drafted solid using OCCT MAT2d BRepOffsetAPI_MakeEvolved (handles vanishing fillets & holes cleanly)."""
+    from reify.sketch import Sketch2D
+
     ang_rad = math.radians(ang_deg)
     inset = h * math.tan(ang_rad)
-    face_z0 = sketch.to_occt_face(z=0.0)
+    outer_face = Sketch2D(sketch.outer).to_occt_face(z=0.0)
     p0 = gp_Pnt(0.0, extra_inset, 0.0)
     p1 = gp_Pnt(0.0, extra_inset + inset, h)
     prof = BRepBuilderAPI_MakeWire(BRepBuilderAPI_MakeEdge(p0, p1).Edge()).Wire()
-    ev = BRepOffsetAPI_MakeEvolved(face_z0, prof, GeomAbs_Arc, True, True, True, 1e-4)
+    ev = BRepOffsetAPI_MakeEvolved(outer_face, prof, GeomAbs_Arc, True, True, True, 1e-4)
     ev.Build()
     if not ev.IsDone() or ev.Shape().IsNull():
         raise RuntimeError("OCCT BRepOffsetAPI_MakeEvolved failed for TaperedExtrude")
     tr = gp_Trsf()
     tr.SetTranslation(gp_Vec(0.0, 0.0, z_bot))
     shp = BRepBuilderAPI_Transform(ev.Shape(), tr, True).Shape()
+
+    for hole in getattr(sketch, "holes", None) or []:
+        # Inner hole shrinks outward with draft (negative inset along +Y in profile)
+        h_face = Sketch2D(hole).to_occt_face(z=0.0)
+        hp0 = gp_Pnt(0.0, -extra_inset, 0.0)
+        hp1 = gp_Pnt(0.0, -extra_inset - inset, h)
+        h_prof = BRepBuilderAPI_MakeWire(BRepBuilderAPI_MakeEdge(hp0, hp1).Edge()).Wire()
+        h_ev = BRepOffsetAPI_MakeEvolved(h_face, h_prof, GeomAbs_Arc, True, True, True, 1e-4)
+        h_ev.Build()
+        if not h_ev.IsDone() or h_ev.Shape().IsNull():
+            raise RuntimeError("OCCT BRepOffsetAPI_MakeEvolved failed for TaperedExtrude hole")
+        h_shp = BRepBuilderAPI_Transform(h_ev.Shape(), tr, True).Shape()
+        cut = BRepAlgoAPI_Cut(shp, h_shp)
+        cut.Build()
+        if not cut.IsDone() or cut.Shape().IsNull():
+            raise RuntimeError("OCCT TaperedExtrude hole cut failed")
+        shp = cut.Shape()
+
     return _fix_shape_if_needed(shp)
 
 
@@ -174,7 +197,7 @@ def _compile_b123d(node: Node, params: dict[str, Any] | None = None):
             if not prism_op.IsDone() or prism_op.Shape().IsNull():
                 raise RuntimeError("OCCT prism failed for TaperedExtrude")
             return BShape(prism_op.Shape())
-        if _supports_mat2d_evolved(node.sketch):
+        if _supports_mat2d_evolved(node.sketch, allow_holes=True):
             return BShape(_compile_evolved_tapered(node.sketch, h, ang_deg, -0.5 * h, 0.0))
         face = node.sketch.to_occt_face(params=params, z=-0.5 * h)
         prism_op = BRepPrimAPI_MakePrism(face, gp_Vec(0.0, 0.0, h))

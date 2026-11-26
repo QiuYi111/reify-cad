@@ -42,6 +42,9 @@
 - `finalize_brep(source, ops, *, irreversible=True, reason="...", params=None)` → `BRepFinalized` (supports `LocalFilletEdges`, `LocalChamferEdges`, `LocalDraftFaces`, `import_step_terminal`).
 - Never pass `BRepFinalized` back into AST operators or `solve()`.
 
-## Pure-SDF Rendering vs STEP Export
+## Pure-SDF Rendering, Viewer & DFM vs STEP Export
 - `reify snapshot`, `reify certify --snapshot-dir`, and `reify autosize --snapshot-dir` render **directly via native PyTorch SDF Sphere Tracing** (zero mesh/GLB/B-Rep conversion, pixel-exact resolution).
+- `reify viewer-sdf <script.py> [--out viewer.html]` compiles Class 1 AST directly to a **60fps WebGL2 GLSL SDF raymarching** HTML viewer (zero triangle meshes, live clip plane & overhang heatmap).
+- `reify export <id> out.glb/.stl/.3mf` uses **Manifold Dual Contouring** (Schaefer-Ju-Warren 2007 + SVD-QEF; `.glb` auto-converts Z-up → glTF Y-up).
 - `reify export <id> out.step` compiles and validates exact OCCT B-Rep (`BRepCheck_Analyzer` + `MAT2d` `MakeEvolved` + dual-backend Hausdorff check) on demand at export time.
+- Extra pure-SDF helpers: `check_draft_and_overhang(...)`, `wost_solve_point(...)` (Walk-on-Stars mixed Dirichlet+Neumann), `GeometryQuery.distance_query(...)` (Affine Arithmetic interval B&B).

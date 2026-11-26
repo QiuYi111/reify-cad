@@ -23,6 +23,7 @@ from reify.cad_bridge import (
 from reify.finalize import BRepFinalized, export_finalized_step, verify_brep_clearance
 from reify.sdf_mesh import extract_sdf_mesh
 from reify.sdf_renderer import render_sdf_snapshot, render_violation_overlay_png
+from reify.sdf_webgl import export_sdf_webgl_html
 from reify.solve import SolveStatus, solve
 from reify.spec import Spec
 from reify.types import CertificationTier, Status
@@ -393,6 +394,24 @@ def _cmd_autosize(argv: list[str]) -> int:
     return 0 if res.status == SolveStatus.FEASIBLE_FOUND else 1
 
 
+def _cmd_viewer_sdf(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(prog="reify viewer-sdf")
+    ap.add_argument("script", type=pathlib.Path)
+    ap.add_argument("--target", default=None)
+    ap.add_argument("--params", default=None)
+    ap.add_argument("--out", type=pathlib.Path, default=None)
+    ns = ap.parse_args(argv)
+
+    script_resolved = ns.script.resolve()
+    mod = _load_script_module(script_resolved)
+    obj = _extract_target(mod, ns.target)
+    params = json.loads(ns.params) if ns.params else None
+    out_html = ns.out or pathlib.Path(f"{ns.script.stem}_sdf_viewer.html")
+    export_sdf_webgl_html(obj, out_html, params=params, title=f"Reify SDF: {ns.script.stem}")
+    print(f"wrote {out_html.resolve()} ({out_html.stat().st_size} bytes, WebGL2 Pure-SDF)")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if not args or args[0] in ("-h", "--help"):
@@ -403,9 +422,10 @@ def main(argv: list[str] | None = None) -> int:
             "  reify run <script.py>\n"
             "  reify snapshot <id> <out.png> [flags...]\n"
             "  reify inspect <id> [ref]\n"
-            "  reify export <id> <out1> [out2...]   (.glb/.stl/.3mf via SDF, .step via verified B-Rep)\n"
+            "  reify export <id> <out1> [out2...]   (.glb/.stl/.3mf via Manifold DC, .step via verified B-Rep)\n"
             "  reify certify <script.py> [--snapshot-dir DIR]\n"
-            "  reify autosize <script.py> [--snapshot-dir DIR]\n\n"
+            "  reify autosize <script.py> [--snapshot-dir DIR]\n"
+            "  reify viewer-sdf <script.py> [--out viewer.html]\n\n"
             "Secondary compatibility fallback:\n"
             "  reify build123d <cad-subcommand...>\n"
         )
@@ -431,6 +451,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_certify(rest)
     if cmd == "autosize":
         return _cmd_autosize(rest)
+    if cmd == "viewer-sdf":
+        return _cmd_viewer_sdf(rest)
     if cmd == "build123d":
         return _forward_cad(rest)
 

@@ -29,6 +29,7 @@ from reify.sdf_renderer import render_sdf_snapshot, render_violation_overlay_png
 from reify.dfm import (
     brute_force_binary_morphology,
     check_directional_wall_thickness,
+    check_draft_and_overhang,
     check_stock_fft_accessibility,
     compute_structural_thickness,
 )
@@ -82,6 +83,10 @@ from reify.physics import (
     run_calculix_or_conformal_fem,
     wos_solve_point,
 )
+from reify.physics.wos import wost_solve_point
+from reify.sdf_mesh import export_sdf_glb, extract_sdf_mesh
+from reify.sdf_renderer import render_sdf_snapshot, render_violation_overlay_png
+from reify.sdf_webgl import export_sdf_webgl_html
 from reify.query import GeometryQuery
 from reify.sketch import (
     Arc2D,
@@ -197,6 +202,7 @@ __all__ = [
     "brute_force_binary_morphology",
     "check_clearance",
     "check_directional_wall_thickness",
+    "check_draft_and_overhang",
     "check_freeze",
     "check_kinematic_sweep",
     "check_material_condition",
@@ -213,6 +219,7 @@ __all__ = [
     "export_calculix_inp",
     "export_finalized_step",
     "export_sdf_glb",
+    "export_sdf_webgl_html",
     "export_step",
     "extract_sdf_mesh",
     "extract_topology_invariants",
@@ -233,4 +240,5 @@ __all__ = [
     "verify",
     "verify_brep_clearance",
     "wos_solve_point",
+    "wost_solve_point",
 ]

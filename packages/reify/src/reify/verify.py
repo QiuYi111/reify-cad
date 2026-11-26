@@ -48,24 +48,57 @@ def _tangent_basis(normals: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 def _collect_interior_candidates(
     query: GeometryQuery, params: dict[str, Any] | None
 ) -> torch.Tensor:
-    """Sample candidate points inside bounding box and return those certified INSIDE."""
-    bmin, bmax = query.root.local_bounds(params)
-    xs = torch.linspace(bmin[0], bmax[0], 7, dtype=torch.float64)
-    ys = torch.linspace(bmin[1], bmax[1], 7, dtype=torch.float64)
-    zs = torch.linspace(bmin[2], bmax[2], 7, dtype=torch.float64)
-    gx, gy, gz = torch.meshgrid(xs, ys, zs, indexing="ij")
-    grid = torch.stack([gx.ravel(), gy.ravel(), gz.ravel()], dim=-1)
-
-    # Also include transformed leaf centers (catches small isolated components!)
+    """Affine Arithmetic octree subdivision to collect guaranteed/candidate INSIDE points (catches thin walls)."""
+    from reify.affine import eval_affine_box
     from reify.query import _iter_transformed_leaves
+
+    root_box = query.root.local_bounds(params)
+    boxes = [root_box]
+    inside_pts: list[list[float]] = []
+
+    for _depth in range(4):
+        next_boxes: list[tuple[tuple[float, float, float], tuple[float, float, float]]] = []
+        for b in boxes:
+            lo, hi = eval_affine_box(query.root, b[0], b[1], params)
+            if lo > 0.0:
+                continue
+            cx = 0.5 * (b[0][0] + b[1][0])
+            cy = 0.5 * (b[0][1] + b[1][1])
+            cz = 0.5 * (b[0][2] + b[1][2])
+            if hi < 0.0:
+                inside_pts.append([cx, cy, cz])
+                continue
+            # Boundary box (lo <= 0 <= hi): subdivide into 8 octants (cap total active boxes)
+            if len(next_boxes) < 256:
+                xs = (b[0][0], cx, b[1][0])
+                ys = (b[0][1], cy, b[1][1])
+                zs = (b[0][2], cz, b[1][2])
+                for ix in range(2):
+                    for iy in range(2):
+                        for iz in range(2):
+                            next_boxes.append(
+                                ((xs[ix], ys[iy], zs[iz]), (xs[ix + 1], ys[iy + 1], zs[iz + 1]))
+                            )
+            else:
+                inside_pts.append([cx, cy, cz])
+        boxes = next_boxes
+        if not boxes:
+            break
+
+    for b in boxes:
+        inside_pts.append([0.5 * (b[0][0] + b[1][0]), 0.5 * (b[0][1] + b[1][1]), 0.5 * (b[0][2] + b[1][2])])
 
     eye = torch.eye(3, dtype=torch.float64)
     zero = torch.zeros(3, dtype=torch.float64)
     leaf_centers = [t_w for _, _, t_w in _iter_transformed_leaves(query.root, params, eye, zero)]
+    pts_list: list[torch.Tensor] = []
+    if inside_pts:
+        pts_list.append(torch.tensor(inside_pts, dtype=torch.float64))
     if leaf_centers:
-        cands = torch.cat([grid, torch.stack(leaf_centers, dim=0)], dim=0)
-    else:
-        cands = grid
+        pts_list.append(torch.stack(leaf_centers, dim=0))
+    if not pts_list:
+        return torch.zeros((0, 3), dtype=torch.float64)
+    cands = torch.cat(pts_list, dim=0)
 
     classes = query.classify_point(cands, params=params)
     inside_idx = [i for i, c in enumerate(classes) if c == PointClass.INSIDE]
