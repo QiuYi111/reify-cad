@@ -12,6 +12,7 @@ import scipy.ndimage
 import torch
 
 from reify.ast import Node, Part
+from reify.device import get_compute_device
 from reify.query import GeometryQuery
 from reify.types import FailReason, Status, VerificationReport
 
@@ -274,12 +275,14 @@ def check_stock_fft_accessibility(
 def _finite_diff_normals(
     q: GeometryQuery, pts: torch.Tensor, params: dict[str, Any] | None, h: float = 1e-4
 ) -> torch.Tensor:
+    dev = pts.device
+    dt = pts.dtype
     grad = torch.zeros_like(pts)
     for d in range(3):
         dx = torch.zeros_like(pts)
         dx[:, d] = h
-        fp = q.eval_field(pts + dx, params=params, dtype=torch.float64)
-        fm = q.eval_field(pts - dx, params=params, dtype=torch.float64)
+        fp = q.eval_field(pts + dx, params=params, dtype=dt)
+        fm = q.eval_field(pts - dx, params=params, dtype=dt)
         grad[:, d] = (fp - fm) / (2.0 * h)
     norms = torch.linalg.norm(grad, dim=-1, keepdim=True).clamp(min=1e-12)
     return grad / norms
@@ -292,6 +295,7 @@ def check_directional_wall_thickness(
     sample_radius: float = 0.6,
     ray_step_mm: float = 0.05,
     params: dict[str, Any] | None = None,
+    device: str | torch.device | None = None,
 ) -> VerificationReport:
     """Screen directional wall thickness within inward normal cone to non-adjacent opposing faces."""
     root = part_node.root if isinstance(part_node, Part) else part_node
@@ -303,7 +307,9 @@ def check_directional_wall_thickness(
             message="Empty surface cover for directional wall thickness check.",
         )
 
-    p_surf = q._project_to_implicit_surface(cov.centers, params=params, steps=8)
+    dev = torch.device(device) if device is not None else get_compute_device(torch.float32)
+    eval_dt = torch.float32 if dev.type == "mps" else torch.float64
+    p_surf = q._project_to_implicit_surface(cov.centers, params=params, steps=8).to(device=dev, dtype=eval_dt)
     n_out = _finite_diff_normals(q, p_surf, params)
     bmin, bmax = root.local_bounds(params)
     max_diag = math.sqrt(sum((bmax[i] - bmin[i]) ** 2 for i in range(3))) + 1.0
@@ -341,8 +347,8 @@ def check_directional_wall_thickness(
         # Lipschitz-safe interior Sphere Tracing (O(N) memory instead of dense ray grid)
         t_cur = np.full(n_pts, t_init, dtype=np.float64)
         t_prev = np.full(n_pts, t_init, dtype=np.float64)
-        p0_t = torch.from_numpy(p_np + t_cur[:, None] * r_dirs).to(torch.float64)
-        v0 = q.eval_field(p0_t, params=params, dtype=torch.float64).detach().cpu().numpy()
+        p0_t = torch.from_numpy(p_np + t_cur[:, None] * r_dirs).to(device=dev, dtype=eval_dt)
+        v0 = q.eval_field(p0_t, params=params, dtype=eval_dt).detach().cpu().numpy()
         active = v0 < -1e-6
         exited = np.zeros(n_pts, dtype=bool)
         t_exit = np.zeros(n_pts, dtype=np.float64)
@@ -351,8 +357,8 @@ def check_directional_wall_thickness(
             idx = np.nonzero(active)[0]
             if idx.size == 0:
                 break
-            pts_m = torch.from_numpy(p_np[idx] + t_cur[idx, None] * r_dirs[idx]).to(torch.float64)
-            vals_m = q.eval_field(pts_m, params=params, dtype=torch.float64).detach().cpu().numpy()
+            pts_m = torch.from_numpy(p_np[idx] + t_cur[idx, None] * r_dirs[idx]).to(device=dev, dtype=eval_dt)
+            vals_m = q.eval_field(pts_m, params=params, dtype=eval_dt).detach().cpu().numpy()
             hit_m = vals_m >= 0.0
             if np.any(hit_m):
                 h_idx = idx[hit_m]
@@ -376,15 +382,15 @@ def check_directional_wall_thickness(
         d_sub = r_dirs[cand_i]
         for _ in range(8):
             t_mid = 0.5 * (t_lo + t_hi)
-            pm = torch.from_numpy(p_sub + t_mid[:, None] * d_sub).to(torch.float64)
-            vm = q.eval_field(pm, params=params, dtype=torch.float64).detach().cpu().numpy()
+            pm = torch.from_numpy(p_sub + t_mid[:, None] * d_sub).to(device=dev, dtype=eval_dt)
+            vm = q.eval_field(pm, params=params, dtype=eval_dt).detach().cpu().numpy()
             inside_m = vm < 0.0
             t_lo = np.where(inside_m, t_mid, t_lo)
             t_hi = np.where(inside_m, t_hi, t_mid)
 
         t_hit = 0.5 * (t_lo + t_hi)
         q_hit = p_sub + t_hit[:, None] * d_sub
-        n_hit = _finite_diff_normals(q, torch.from_numpy(q_hit).to(torch.float64), params).detach().cpu().numpy()
+        n_hit = _finite_diff_normals(q, torch.from_numpy(q_hit).to(device=dev, dtype=eval_dt), params).detach().cpu().numpy()
         # Non-adjacent opposing surface filter: dot(n_start, n_hit) < -0.5 (angle > 120 deg)
         dots = np.sum(n_np[cand_i] * n_hit, axis=-1)
         opposing = (dots < -0.5) & (t_hit > 2.5 * ray_step_mm)
@@ -492,6 +498,7 @@ def check_draft_and_overhang(
     max_overhang_deg: float = 45.0,
     sample_radius: float = 0.8,
     params: dict[str, Any] | None = None,
+    device: str | torch.device | None = None,
 ) -> VerificationReport:
     """Pure-SDF analytic surface normal screening for molding draft angle and 3D-printing overhang."""
     root = part_node.root if isinstance(part_node, Part) else part_node
@@ -500,8 +507,10 @@ def check_draft_and_overhang(
     if cov.centers.shape[0] == 0:
         return VerificationReport(status=Status.OUT_OF_DOMAIN, message="Empty surface cover.")
 
+    dev = torch.device(device) if device is not None else get_compute_device(torch.float32)
+    eval_dt = torch.float32 if dev.type == "mps" else torch.float64
     p_surf = q._project_to_implicit_surface(cov.centers, params=params, steps=8)
-    n_out = _finite_diff_normals(q, p_surf, params).detach().cpu().numpy()
+    n_out = _finite_diff_normals(q, p_surf.to(device=dev, dtype=eval_dt), params).detach().cpu().numpy()
     p_np = p_surf.detach().cpu().numpy()
 
     d_vec = np.asarray(pull_dir, dtype=np.float64)

@@ -8,6 +8,7 @@ from typing import Any, Callable
 import numpy as np
 import torch
 
+from reify.device import get_compute_device
 from reify.query import GeometryQuery
 from reify.types import FailReason, PointClass, Status, VerificationReport
 
@@ -25,6 +26,7 @@ def wos_solve_point(
     limit_max: float | None = None,
     seed: int = 0,
     params: dict[str, Any] | None = None,
+    device: str | torch.device | None = None,
 ) -> VerificationReport:
     """IID Monte Carlo WoS for 3D homogeneous Laplace/Poisson with Dirichlet BC."""
     if medium != "homogeneous" or bc_type != "dirichlet":
@@ -35,6 +37,9 @@ def wos_solve_point(
                 f"got medium={medium!r}, bc_type={bc_type!r}."
             ),
         )
+
+    dev = torch.device(device) if device is not None else get_compute_device(torch.float32)
+    eval_dt = torch.float32 if dev.type == "mps" else torch.float64
 
     p0 = torch.tensor([list(point_xyz)], dtype=torch.float64)
     if query.classify_point(p0, params=params)[0] != PointClass.INSIDE:
@@ -52,7 +57,7 @@ def wos_solve_point(
         if not np.any(active):
             break
         idx = np.nonzero(active)[0]
-        x_act = torch.from_numpy(x[idx]).to(torch.float64)
+        x_act = torch.from_numpy(x[idx]).to(device=dev, dtype=eval_dt)
         R = query.unsigned_boundary_distance_lower(x_act, params=params).detach().cpu().numpy()
 
         done_mask = R <= eps_shell_mm
@@ -153,8 +158,11 @@ def wost_solve_point(
     max_steps: int = 256,
     seed: int = 0,
     params: dict[str, Any] | None = None,
+    device: str | torch.device | None = None,
 ) -> VerificationReport:
     """Walk-on-Stars (Sawhney et al., SIGGRAPH 2023) for 3D Laplace/Poisson with mixed Dirichlet + Neumann BCs."""
+    dev = torch.device(device) if device is not None else get_compute_device(torch.float32)
+    eval_dt = torch.float32 if dev.type == "mps" else torch.float64
     p0 = torch.tensor([list(point_xyz)], dtype=torch.float64)
     if query.classify_point(p0, params=params)[0] != PointClass.INSIDE:
         return VerificationReport(
@@ -176,7 +184,7 @@ def wost_solve_point(
             dtype=np.float64,
         )
         probe = (pts_np[:, None, :] + offs[None, :, :]).reshape(-1, 3)
-        v = query.eval_field(torch.from_numpy(probe), params=params, dtype=torch.float64).detach().cpu().numpy().reshape(-1, 6)
+        v = query.eval_field(torch.from_numpy(probe).to(device=dev, dtype=eval_dt), params=params, dtype=eval_dt).detach().cpu().numpy().reshape(-1, 6)
         g = np.stack([v[:, 0] - v[:, 1], v[:, 2] - v[:, 3], v[:, 4] - v[:, 5]], axis=-1) / (2.0 * h)
         return g / np.maximum(np.linalg.norm(g, axis=-1, keepdims=True), 1e-12)
 
@@ -225,7 +233,7 @@ def wost_solve_point(
             if r_idx.size == 0:
                 break
             p_m = x[c_idx[r_idx]] + t[r_idx, None] * ray_dir[r_idx]
-            f_m = query.eval_field(torch.from_numpy(p_m), params=params, dtype=torch.float64).detach().cpu().numpy()
+            f_m = query.eval_field(torch.from_numpy(p_m).to(device=dev, dtype=eval_dt), params=params, dtype=eval_dt).detach().cpu().numpy()
             # Inside -> f_m < 0; distance to boundary is |f_m| / L_dom
             dist_b = np.maximum(-f_m, 0.0) / L_dom
             reached_bnd = (f_m >= -eps_shell_mm) & (t[r_idx] > 2.5 * eps_shell_mm)

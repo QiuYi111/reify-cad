@@ -159,3 +159,83 @@ def test_v2_1_unequal_loft_holed_draft_and_webgl_viewer(tmp_path: pathlib.Path) 
     )
     txt = html_p.read_text(encoding="utf-8")
     assert "webgl2" in txt and "mapScene" in txt and "sdShellTaperedOpenZ" in txt
+
+
+def test_v2_2_gpu_mps_or_cuda_parity_and_renderer(tmp_path: pathlib.Path):
+    """Verify CUDA/MPS GPU backend parity against CPU on SDF evaluation and Sphere Tracing render."""
+    import numpy as np
+    import torch
+    from PIL import Image
+
+    from reify import device_info, get_compute_device, render_sdf_snapshot
+
+    info = device_info()
+    assert "active_float32_device" in info and "mps_available" in info and "cuda_available" in info
+    assert get_compute_device(torch.float32, prefer="cpu").type == "cpu"
+
+    part = Part(
+        Union(
+            [
+                Transform(Box(mm(30), mm(20), mm(12)), translation=(mm(0), mm(0), mm(6))),
+                Transform(Frustum(mm(4.0), mm(1.5), mm(18)), translation=(mm(10), mm(0), mm(18)), rotation_deg=(deg(15), deg(0), deg(0))),
+            ]
+        ),
+        name="gpu_part",
+    )
+
+    gpu_dev = None
+    if torch.cuda.is_available():
+        gpu_dev = "cuda"
+    elif torch.backends.mps.is_available():
+        gpu_dev = "mps"
+
+    cpu_png = tmp_path / "cpu.png"
+    render_sdf_snapshot(part, cpu_png, width=256, height=192, device="cpu")
+    assert cpu_png.exists() and cpu_png.stat().st_size > 1000
+
+    if gpu_dev is not None:
+        gpu_png = tmp_path / "gpu.png"
+        render_sdf_snapshot(part, gpu_png, width=256, height=192, device=gpu_dev)
+        a = np.asarray(Image.open(cpu_png), dtype=np.int16)
+        b = np.asarray(Image.open(gpu_png), dtype=np.int16)
+        assert np.abs(a - b).mean() < 1.0
+
+
+def test_v2_2_dual_nonexact_distance_query_stage3():
+    """Verify Stage 3 sparse 6D B&B closes dual non-exact SmoothUnion vs SmoothUnion to < 1e-3 mm."""
+    su_a = SmoothUnion(
+        Box(mm(10), mm(10), mm(10)),
+        Transform(Sphere(mm(6)), translation=(mm(6), mm(0), mm(0))),
+        k=mm(2.0),
+    )
+    su_b = Transform(su_a, translation=(mm(26.0), mm(0.0), mm(0.0)))
+    res = GeometryQuery(su_a).distance_query(GeometryQuery(su_b), deflection=1e-4)
+    assert res.status == Status.PASS
+    assert not res.containment
+    assert (res.upper_bound - res.lower_bound) < 1e-3
+    assert abs(res.value - 9.0) < 0.05
+
+
+def test_v2_2_webgl_3d_texture_universal_fallback_and_multipart_step(tmp_path: pathlib.Path):
+    """Verify sampler3D baked 3D texture fallback in WebGL2 viewer and multi-part dict STEP export."""
+    import torch
+    from reify import FreeImplicit, export_sdf_webgl_html, export_step
+
+    imp = FreeImplicit(
+        lambda p: torch.linalg.norm(p, dim=-1) - 10.0,
+        bounds=((-12.0, -12.0, -12.0), (12.0, 12.0, 12.0)),
+        lipschitz=1.0,
+    )
+    html_p = tmp_path / "implicit_viewer.html"
+    export_sdf_webgl_html(imp, html_p)
+    txt = html_p.read_text(encoding="utf-8")
+    assert "sampler3D" in txt and "sdVolume3D" in txt and "uVol0" in txt and "texImage3D" in txt
+
+    asm = {
+        "base": Part(Box(mm(20), mm(20), mm(6)), name="base"),
+        "post": Part(Transform(Cylinder(mm(4), mm(14)), translation=(mm(0), mm(0), mm(10))), name="post"),
+    }
+    step_p = tmp_path / "asm.step"
+    rep = export_step(asm, step_p)
+    assert rep.status == Status.PASS, rep.message
+    assert step_p.exists() and rep.metrics["topology"]["solids"] == 2

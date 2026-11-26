@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import base64
+import json
 import math
 import pathlib
 from typing import Any
+
+import numpy as np
 
 from reify.ast import (
     Box,
@@ -13,6 +17,7 @@ from reify.ast import (
     Intersect,
     Node,
     Part,
+    Scale,
     SmoothUnion,
     Sphere,
     Subtract,
@@ -22,6 +27,7 @@ from reify.ast import (
     _val_mm_float,
 )
 from reify.features import CircularPattern, ExtrudeSketch, Frustum, LinearPattern, Offset, Shell, TaperedExtrude
+from reify.sdf_mesh import _eval_sdf_batched
 
 _PALETTE_RGB = (
     (0.290, 0.435, 0.647),
@@ -56,12 +62,52 @@ def _glsl_mat3_inv_xyz(rx_deg: float, ry_deg: float, rz_deg: float) -> str:
     return f"mat3({', '.join(cols)})"
 
 
+def _bake_volume_3d(
+    node: Node,
+    params: dict[str, Any] | None,
+    vol_idx: int,
+    grid_n: int = 48,
+) -> dict[str, Any]:
+    """Bake any arbitrary SDF AST node into a padded (grid_n^3) R8 3D texture for WebGL2 sampler3D."""
+    bmin_t, bmax_t = node.local_bounds(params)
+    bmin = np.asarray(bmin_t, dtype=np.float64)
+    bmax = np.asarray(bmax_t, dtype=np.float64)
+    ext = np.maximum(bmax - bmin, 1e-2)
+    pad = max(0.5, 0.08 * float(np.max(ext)))
+    vmin = bmin - pad
+    vmax = bmax + pad
+
+    xs = np.linspace(vmin[0], vmax[0], grid_n, dtype=np.float64)
+    ys = np.linspace(vmin[1], vmax[1], grid_n, dtype=np.float64)
+    zs = np.linspace(vmin[2], vmax[2], grid_n, dtype=np.float64)
+    gx, gy, gz = np.meshgrid(xs, ys, zs, indexing="ij")
+    pts = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=-1)
+    vals = _eval_sdf_batched(node, pts, params).reshape(grid_n, grid_n, grid_n)
+    # WebGL texImage3D expects (depth=Z, height=Y, width=X)
+    vals_zyx = np.transpose(vals, (2, 1, 0)).astype(np.float64)
+    dmin = float(np.min(vals_zyx))
+    dmax = float(np.max(vals_zyx))
+    if dmax - dmin < 1e-6:
+        dmax = dmin + 1.0
+    u8 = np.clip(np.round(((vals_zyx - dmin) / (dmax - dmin)) * 255.0), 0.0, 255.0).astype(np.uint8)
+    return {
+        "uniform": f"uVol{vol_idx}",
+        "n": grid_n,
+        "bmin": [float(vmin[0]), float(vmin[1]), float(vmin[2])],
+        "bmax": [float(vmax[0]), float(vmax[1]), float(vmax[2])],
+        "dmin": dmin,
+        "dmax": dmax,
+        "b64": base64.b64encode(u8.tobytes()).decode("ascii"),
+    }
+
+
 def _emit_glsl_node(
     node: Node,
     p_expr: str,
     params: dict[str, Any] | None,
     lines: list[str],
     counter: list[int],
+    volumes: list[dict[str, Any]],
 ) -> str:
     """Emit GLSL float SDF expression variable name for a Class 1 AST node."""
     vid = f"d_{counter[0]}"
@@ -82,8 +128,17 @@ def _emit_glsl_node(
             lines.append(f"  vec3 {p_loc} = {rt} * ({p_expr} - {t_glsl});")
         else:
             lines.append(f"  vec3 {p_loc} = {p_expr} - {t_glsl};")
-        ch_v = _emit_glsl_node(node.child, p_loc, params, lines, counter)
+        ch_v = _emit_glsl_node(node.child, p_loc, params, lines, counter, volumes)
         lines.append(f"  float {vid} = {ch_v};")
+        return vid
+
+    if isinstance(node, Scale):
+        p_loc = f"p_{counter[0]}"
+        counter[0] += 1
+        lines.append(f"  vec3 {p_loc} = {p_expr} / vec3({node.sx:.6f}, {node.sy:.6f}, {node.sz:.6f});")
+        ch_v = _emit_glsl_node(node.child, p_loc, params, lines, counter, volumes)
+        smin = min(node.sx, node.sy, node.sz)
+        lines.append(f"  float {vid} = {ch_v} * {smin:.6f};")
         return vid
 
     if isinstance(node, Box):
@@ -144,7 +199,7 @@ def _emit_glsl_node(
 
     if isinstance(node, Offset):
         r = _val_mm_float(node.radius, params)
-        ch_v = _emit_glsl_node(node.child, p_expr, params, lines, counter)
+        ch_v = _emit_glsl_node(node.child, p_expr, params, lines, counter, volumes)
         lines.append(f"  float {vid} = {ch_v} - {r:.6f};")
         return vid
 
@@ -163,12 +218,12 @@ def _emit_glsl_node(
                     f"  float {vid} = sdShellTaperedOpenZ({p_expr}, {hx:.6f}, {hy:.6f}, {r:.6f}, {hz:.6f}, {math.cos(th):.7f}, {math.sin(th):.7f}, {t_w:.6f});"
                 )
                 return vid
-        ch_v = _emit_glsl_node(node.child, p_expr, params, lines, counter)
+        ch_v = _emit_glsl_node(node.child, p_expr, params, lines, counter, volumes)
         lines.append(f"  float {vid} = max({ch_v}, -({ch_v} + {t_w:.6f}));")
         return vid
 
     if isinstance(node, Union):
-        ch_vars = [_emit_glsl_node(ch, p_expr, params, lines, counter) for ch in node.children]
+        ch_vars = [_emit_glsl_node(ch, p_expr, params, lines, counter, volumes) for ch in node.children]
         cur = ch_vars[0]
         for cv in ch_vars[1:]:
             cur = f"min({cur}, {cv})"
@@ -176,7 +231,7 @@ def _emit_glsl_node(
         return vid
 
     if isinstance(node, Intersect):
-        ch_vars = [_emit_glsl_node(ch, p_expr, params, lines, counter) for ch in node.children]
+        ch_vars = [_emit_glsl_node(ch, p_expr, params, lines, counter, volumes) for ch in node.children]
         cur = ch_vars[0]
         for cv in ch_vars[1:]:
             cur = f"max({cur}, {cv})"
@@ -184,14 +239,14 @@ def _emit_glsl_node(
         return vid
 
     if isinstance(node, Subtract):
-        vb = _emit_glsl_node(node.base, p_expr, params, lines, counter)
-        vt = _emit_glsl_node(node.tool, p_expr, params, lines, counter)
+        vb = _emit_glsl_node(node.base, p_expr, params, lines, counter, volumes)
+        vt = _emit_glsl_node(node.tool, p_expr, params, lines, counter, volumes)
         lines.append(f"  float {vid} = max({vb}, -({vt}));")
         return vid
 
     if isinstance(node, SmoothUnion):
-        va = _emit_glsl_node(node.a, p_expr, params, lines, counter)
-        vb = _emit_glsl_node(node.b, p_expr, params, lines, counter)
+        va = _emit_glsl_node(node.a, p_expr, params, lines, counter, volumes)
+        vb = _emit_glsl_node(node.b, p_expr, params, lines, counter, volumes)
         k = _val_mm_float(node.k, params)
         lines.append(f"  float {vid} = sminQuad({va}, {vb}, {k:.6f});")
         return vid
@@ -205,7 +260,7 @@ def _emit_glsl_node(
             pk = f"p_{counter[0]}"
             counter[0] += 1
             lines.append(f"  vec3 {pk} = {p_expr} - vec3({k*sx:.6f}, {k*sy:.6f}, {k*sz:.6f});")
-            acc.append(_emit_glsl_node(node.child, pk, params, lines, counter))
+            acc.append(_emit_glsl_node(node.child, pk, params, lines, counter, volumes))
         expr = acc[0]
         for a in acc[1:]:
             expr = f"min({expr}, {a})"
@@ -224,18 +279,22 @@ def _emit_glsl_node(
             lines.append(
                 f"  vec3 {pk} = mat3({ca:.7f}, {-sa:.7f}, 0.0, {sa:.7f}, {ca:.7f}, 0.0, 0.0, 0.0, 1.0) * ({p_expr} - vec3({rad*ca:.6f}, {rad*sa:.6f}, 0.0));"
             )
-            acc.append(_emit_glsl_node(node.child, pk, params, lines, counter))
+            acc.append(_emit_glsl_node(node.child, pk, params, lines, counter, volumes))
         expr = acc[0]
         for a in acc[1:]:
             expr = f"min({expr}, {a})"
         lines.append(f"  float {vid} = {expr};")
         return vid
 
-    # Fallback AABB box for unsupported complex spline/NURBS leaf inside WebGL shader
-    bmin, bmax = node.local_bounds(params)
-    cx, cy, cz = (0.5 * (bmin[i] + bmax[i]) for i in range(3))
-    hx, hy, hz = (0.5 * max(bmax[i] - bmin[i], 0.5) for i in range(3))
-    lines.append(f"  float {vid} = sdBox({p_expr} - vec3({cx:.6f}, {cy:.6f}, {cz:.6f}), vec3({hx:.6f}, {hy:.6f}, {hz:.6f}));")
+    # Universal WebGL2 sampler3D baked SDF volume fallback for FreeImplicit / NURBS / general splines
+    vol = _bake_volume_3d(node, params, len(volumes))
+    volumes.append(vol)
+    bmin = vol["bmin"]
+    bmax = vol["bmax"]
+    lines.append(
+        f"  float {vid} = sdVolume3D({p_expr}, vec3({bmin[0]:.6f}, {bmin[1]:.6f}, {bmin[2]:.6f}), "
+        f"vec3({bmax[0]:.6f}, {bmax[1]:.6f}, {bmax[2]:.6f}), {vol['dmin']:.6f}, {vol['dmax']:.6f}, {vol['uniform']});"
+    )
     return vid
 
 
@@ -254,6 +313,7 @@ def export_sdf_webgl_html(
     bmins, bmaxs = [], []
     map_lines: list[str] = ["  float bestD = 1e9;", "  float bestId = 0.0;"]
     counter = [0]
+    volumes: list[dict[str, Any]] = []
     colors_glsl = []
 
     for idx, (_name, item) in enumerate(items):
@@ -262,7 +322,7 @@ def export_sdf_webgl_html(
         bmins.append(mn)
         bmaxs.append(mx)
         lip = max(1.0, float(root.lipschitz_bound(params)))
-        dv = _emit_glsl_node(root, "p", params, map_lines, counter)
+        dv = _emit_glsl_node(root, "p", params, map_lines, counter, volumes)
         map_lines.append(f"  float ds_{idx} = {dv} / {lip:.4f};")
         map_lines.append(f"  if (ds_{idx} < bestD) {{ bestD = ds_{idx}; bestId = {float(idx):.1f}; }}")
         c = _PALETTE_RGB[idx % len(_PALETTE_RGB)]
@@ -276,6 +336,8 @@ def export_sdf_webgl_html(
 
     map_body = "\n".join(map_lines)
     color_body = "\n".join(colors_glsl)
+    vol_uniforms = "\n".join(f"uniform highp sampler3D {v['uniform']};" for v in volumes)
+    vol_json = json.dumps(volumes)
 
     html = f"""<!doctype html>
 <html lang="en">
@@ -327,8 +389,17 @@ uniform vec3 uCamPos, uTarget;
 uniform float uHalfH;
 uniform int uMode, uClipAx;
 uniform float uClipAt;
+{vol_uniforms}
 
 float sdBox(vec3 p, vec3 b) {{ vec3 q = abs(p) - b; return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0); }}
+float sdVolume3D(vec3 p, vec3 bmin, vec3 bmax, float dmin, float dmax, highp sampler3D vol) {{
+  vec3 c = 0.5 * (bmin + bmax);
+  vec3 h = 0.5 * (bmax - bmin);
+  float dbox = sdBox(p - c, h);
+  vec3 uvw = clamp((p - bmin) / max(bmax - bmin, vec3(1e-5)), 0.0, 1.0);
+  float dsdf = mix(dmin, dmax, texture(vol, uvw).r);
+  return (dbox > 0.0) ? (dbox + max(dsdf, 0.0)) : dsdf;
+}}
 float sdCylinderZ(vec3 p, float r, float hz) {{ vec2 d = vec2(length(p.xy) - r, abs(p.z) - hz); return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0); }}
 float sdFrustumZ(vec3 p, float r1, float r2, float hz) {{
   vec2 q = vec2(length(p.xy), p.z);
@@ -422,6 +493,24 @@ gl.linkProgram(prog); gl.useProgram(prog);
 const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf);
 gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
 const loc = gl.getAttribLocation(prog, 'aPos'); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+const VOLS = {vol_json};
+VOLS.forEach((v, idx) => {{
+  const bin = atob(v.b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const tex = gl.createTexture();
+  gl.activeTexture(gl.TEXTURE0 + idx);
+  gl.bindTexture(gl.TEXTURE_3D, tex);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
+  gl.texImage3D(gl.TEXTURE_3D, 0, gl.R8, v.n, v.n, v.n, 0, gl.RED, gl.UNSIGNED_BYTE, bytes);
+  gl.uniform1i(gl.getUniformLocation(prog, v.uniform), idx);
+}});
 
 let az = -0.78, el = 0.58, target = [{cx:.3f}, {cy:.3f}, {cz:.3f}], halfH = {diag * 0.55:.3f};
 let drag = false, shift = false, lx = 0, ly = 0;

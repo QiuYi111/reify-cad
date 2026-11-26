@@ -13,6 +13,7 @@ import torch
 from PIL import Image
 
 from reify.ast import Box, Node, Part, Sphere, Transform
+from reify.device import get_compute_device
 from reify.finalize import BRepFinalized
 from reify.types import VerificationReport
 
@@ -45,9 +46,11 @@ def _normalize_parts(
     *,
     params: dict[str, Any] | None = None,
     color: str | None = None,
+    device: torch.device | None = None,
 ) -> list[_ScenePart]:
     if isinstance(obj, BRepFinalized):
         raise NotImplementedError("render_sdf_snapshot does not render Class 2 BRepFinalized; use cad glb snapshot.")
+    dev = device if device is not None else torch.device("cpu")
     items = list(obj.items()) if isinstance(obj, dict) else [(obj.name if isinstance(obj, Part) else "part", obj)]
     parts: list[_ScenePart] = []
     for idx, (name, item) in enumerate(items):
@@ -61,8 +64,8 @@ def _normalize_parts(
             _ScenePart(
                 name=str(name),
                 root=root,
-                bmin=torch.tensor(bmin_t, dtype=torch.float32),
-                bmax=torch.tensor(bmax_t, dtype=torch.float32),
+                bmin=torch.tensor(bmin_t, dtype=torch.float32, device=dev),
+                bmax=torch.tensor(bmax_t, dtype=torch.float32, device=dev),
                 lip=lip,
                 color=_hex_to_rgb01(c_hex),
             )
@@ -70,8 +73,9 @@ def _normalize_parts(
     return parts
 
 
-def _parse_camera_dir(camera: str) -> tuple[torch.Tensor, torch.Tensor]:
+def _parse_camera_dir(camera: str, device: torch.device | None = None) -> tuple[torch.Tensor, torch.Tensor]:
     """Return unit view direction (from scene toward camera) and world up hint (Z-up)."""
+    dev = device if device is not None else torch.device("cpu")
     cam = (camera or "iso").strip().lower()
     if ":" in cam:
         az_s, el_s = cam.split(":", 1)
@@ -80,20 +84,23 @@ def _parse_camera_dir(camera: str) -> tuple[torch.Tensor, torch.Tensor]:
         v = torch.tensor(
             [math.cos(el) * math.cos(az), math.cos(el) * math.sin(az), math.sin(el)],
             dtype=torch.float32,
+            device=dev,
         )
-        up = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32)
+        up = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device=dev)
         return v / torch.linalg.norm(v), up
 
     presets = {
-        "iso": (torch.tensor([1.0, -1.0, 0.85], dtype=torch.float32), torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32)),
-        "top": (torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32), torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32)),
-        "bottom": (torch.tensor([0.0, 0.0, -1.0], dtype=torch.float32), torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32)),
-        "front": (torch.tensor([0.0, -1.0, 0.0], dtype=torch.float32), torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32)),
-        "back": (torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32), torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32)),
-        "left": (torch.tensor([-1.0, 0.0, 0.0], dtype=torch.float32), torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32)),
-        "right": (torch.tensor([1.0, 0.0, 0.0], dtype=torch.float32), torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32)),
+        "iso": ([1.0, -1.0, 0.85], [0.0, 0.0, 1.0]),
+        "top": ([0.0, 0.0, 1.0], [0.0, 1.0, 0.0]),
+        "bottom": ([0.0, 0.0, -1.0], [0.0, 1.0, 0.0]),
+        "front": ([0.0, -1.0, 0.0], [0.0, 0.0, 1.0]),
+        "back": ([0.0, 1.0, 0.0], [0.0, 0.0, 1.0]),
+        "left": ([-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]),
+        "right": ([1.0, 0.0, 0.0], [0.0, 0.0, 1.0]),
     }
-    v, up = presets.get(cam, presets["iso"])
+    v_l, u_l = presets.get(cam, presets["iso"])
+    v = torch.tensor(v_l, dtype=torch.float32, device=dev)
+    up = torch.tensor(u_l, dtype=torch.float32, device=dev)
     return v / torch.linalg.norm(v), up
 
 
@@ -149,16 +156,17 @@ def _eval_scene(
     clip_cfg: tuple[bool, int, float, float],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Evaluate conservative scene SDF step, winning part_id, and clip-cap mask on (N, 3) pts."""
+    dev = pts.device
     n = pts.shape[0]
     if n == 0:
         return (
-            torch.zeros(0, dtype=torch.float32),
-            torch.zeros(0, dtype=torch.long),
-            torch.zeros(0, dtype=torch.bool),
+            torch.zeros(0, dtype=torch.float32, device=dev),
+            torch.zeros(0, dtype=torch.long, device=dev),
+            torch.zeros(0, dtype=torch.bool, device=dev),
         )
 
-    best_d = torch.full((n,), 1e9, dtype=torch.float32)
-    best_pid = torch.zeros((n,), dtype=torch.long)
+    best_d = torch.full((n,), 1e9, dtype=torch.float32, device=dev)
+    best_pid = torch.zeros((n,), dtype=torch.long, device=dev)
 
     for k, part in enumerate(parts):
         if len(parts) == 1:
@@ -173,7 +181,7 @@ def _eval_scene(
                 dim=-1,
             )
             mask = d_box < best_d + 1e-3
-            dk = torch.full((n,), 1e9, dtype=torch.float32)
+            dk = torch.full((n,), 1e9, dtype=torch.float32, device=dev)
             if torch.any(mask):
                 sub_pts = pts[mask]
                 fk = part.root.eval_sdf(sub_pts, params=params, dtype=torch.float32)
@@ -190,7 +198,7 @@ def _eval_scene(
         is_cap = d_clip > best_d
         d_step = torch.maximum(best_d, d_clip)
     else:
-        is_cap = torch.zeros((n,), dtype=torch.bool)
+        is_cap = torch.zeros((n,), dtype=torch.bool, device=dev)
         d_step = best_d
 
     return d_step, best_pid, is_cap
@@ -211,11 +219,12 @@ def _sphere_trace(
     polish: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Lipschitz-safe batched Sphere Tracing with active-ray compaction."""
+    dev = origins.device
     n = origins.shape[0]
     t = t_init.clone()
-    hit = torch.zeros((n,), dtype=torch.bool)
-    hit_pid = torch.zeros((n,), dtype=torch.long)
-    hit_cap = torch.zeros((n,), dtype=torch.bool)
+    hit = torch.zeros((n,), dtype=torch.bool, device=dev)
+    hit_pid = torch.zeros((n,), dtype=torch.long, device=dev)
+    hit_cap = torch.zeros((n,), dtype=torch.bool, device=dev)
 
     idx = torch.nonzero(active_mask, as_tuple=False).squeeze(-1)
     for _ in range(max_steps):
@@ -258,8 +267,9 @@ def _compute_part_normals(
     h_fd: float,
 ) -> torch.Tensor:
     """Compute central-difference SDF normals per winning part (zero cross-part normal bleed)."""
+    dev = hit_pts.device
     m = hit_pts.shape[0]
-    normals = torch.zeros((m, 3), dtype=torch.float32)
+    normals = torch.zeros((m, 3), dtype=torch.float32, device=dev)
     if m == 0:
         return normals
 
@@ -273,6 +283,7 @@ def _compute_part_normals(
             [0.0, 0.0, -h_fd],
         ],
         dtype=torch.float32,
+        device=dev,
     )
 
     non_cap = ~hit_cap
@@ -292,7 +303,7 @@ def _compute_part_normals(
 
     if torch.any(hit_cap):
         _, clip_ax, _, clip_sign = clip_cfg
-        cap_n = torch.zeros((3,), dtype=torch.float32)
+        cap_n = torch.zeros((3,), dtype=torch.float32, device=dev)
         cap_n[clip_ax] = clip_sign
         normals[hit_cap] = cap_n
 
@@ -308,10 +319,11 @@ def _compute_ao(
     scene_rad: float,
 ) -> torch.Tensor:
     """5-tap SDF ambient occlusion along surface normal."""
+    dev = hit_pts.device
     m = hit_pts.shape[0]
     if m == 0:
-        return torch.zeros((0,), dtype=torch.float32)
-    ao = torch.zeros((m,), dtype=torch.float32)
+        return torch.zeros((0,), dtype=torch.float32, device=dev)
+    ao = torch.zeros((m,), dtype=torch.float32, device=dev)
     taps = (0.008, 0.025, 0.070)
     weights = (0.45, 0.35, 0.20)
     for frac, w in zip(taps, weights):
@@ -331,7 +343,9 @@ def _render_parts_to_png(
     display: str | dict[str, Any] | None = None,
     width: int = 800,
     height: int = 600,
+    device: torch.device | None = None,
 ) -> pathlib.Path:
+    dev = device if device is not None else get_compute_device(torch.float32)
     with torch.no_grad():
         scene_bmin = torch.amin(torch.stack([p.bmin for p in parts], dim=0), dim=0)
         scene_bmax = torch.amax(torch.stack([p.bmax for p in parts], dim=0), dim=0)
@@ -340,21 +354,22 @@ def _render_parts_to_png(
         scene_diag = float(torch.linalg.norm(extents))
         scene_rad = 0.5 * scene_diag
 
-        view_from_dir, up_hint = _parse_camera_dir(camera)
+        view_from_dir, up_hint = _parse_camera_dir(camera, device=dev)
         ray_dir = -view_from_dir
         right = torch.linalg.cross(ray_dir, up_hint)
         if float(torch.linalg.norm(right)) < 1e-5:
-            right = torch.linalg.cross(ray_dir, torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32))
+            right = torch.linalg.cross(ray_dir, torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32, device=dev))
         right = right / torch.linalg.norm(right)
         cam_up = torch.linalg.cross(right, ray_dir)
         cam_up = cam_up / torch.linalg.norm(cam_up)
 
         # Project 8 corners of scene AABB onto (right, cam_up, view_from_dir) for tight framing
         corners = torch.tensor(
-            [[scene_bmin[0] if (i & 1) == 0 else scene_bmax[0],
-              scene_bmin[1] if (i & 2) == 0 else scene_bmax[1],
-              scene_bmin[2] if (i & 4) == 0 else scene_bmax[2]] for i in range(8)],
+            [[float(scene_bmin[0]) if (i & 1) == 0 else float(scene_bmax[0]),
+              float(scene_bmin[1]) if (i & 2) == 0 else float(scene_bmax[1]),
+              float(scene_bmin[2]) if (i & 4) == 0 else float(scene_bmax[2])] for i in range(8)],
             dtype=torch.float32,
+            device=dev,
         )
         rel = corners - center[None, :]
         proj_u = rel @ right
@@ -380,8 +395,8 @@ def _render_parts_to_png(
 
         # 1. 4x Coarse pre-pass
         cw, ch = max(16, width // 4), max(16, height // 4)
-        cu = torch.linspace(-half_w, half_w, cw, dtype=torch.float32)
-        cv = torch.linspace(half_h, -half_h, ch, dtype=torch.float32)
+        cu = torch.linspace(-half_w, half_w, cw, dtype=torch.float32, device=dev)
+        cv = torch.linspace(half_h, -half_h, ch, dtype=torch.float32, device=dev)
         cug, cvg = torch.meshgrid(cu, cv, indexing="xy")  # (ch, cw)
         c_origins = (
             cam_center[None, :]
@@ -411,8 +426,8 @@ def _render_parts_to_png(
         c_any_hit = torch.nn.functional.max_pool2d(c_hit.float().reshape(1, 1, ch, cw), kernel_size=3, stride=1, padding=1) > 0.5
         c_all_hit = (-torch.nn.functional.max_pool2d(-c_hit.float().reshape(1, 1, ch, cw), kernel_size=3, stride=1, padding=1)) > 0.5
 
-        f_u = torch.linspace(-half_w, half_w, width, dtype=torch.float32)
-        f_v = torch.linspace(half_h, -half_h, height, dtype=torch.float32)
+        f_u = torch.linspace(-half_w, half_w, width, dtype=torch.float32, device=dev)
+        f_v = torch.linspace(half_h, -half_h, height, dtype=torch.float32, device=dev)
         fug, fvg = torch.meshgrid(f_u, f_v, indexing="xy")  # (H, W)
         f_origins = (
             cam_center[None, :]
@@ -422,8 +437,8 @@ def _render_parts_to_png(
         f_active, f_tnear, f_tfar = _ray_aabb_intersect(f_origins, ray_dir, scene_bmin_pad, scene_bmax_pad)
 
         # Map each fine pixel to nearest coarse cell for safe t_start
-        ci_y = torch.clamp((torch.arange(height) * ch) // height, 0, ch - 1)
-        ci_x = torch.clamp((torch.arange(width) * cw) // width, 0, cw - 1)
+        ci_y = torch.clamp((torch.arange(height, device=dev) * ch) // height, 0, ch - 1)
+        ci_x = torch.clamp((torch.arange(width, device=dev) * cw) // width, 0, cw - 1)
         gy_idx, gx_idx = torch.meshgrid(ci_y, ci_x, indexing="ij")
         fine_min_d = c_min_3x3[0, 0, gy_idx, gx_idx].reshape(-1)
         fine_all_hit = c_all_hit[0, 0, gy_idx, gx_idx].reshape(-1)
@@ -459,12 +474,12 @@ def _render_parts_to_png(
         )
 
         # 3. Shading on hit pixels
-        bg_rgb = torch.tensor([0.945, 0.960, 0.980], dtype=torch.float32)  # #f1f5f9 studio background
+        bg_rgb = torch.tensor([0.945, 0.960, 0.980], dtype=torch.float32, device=dev)  # #f1f5f9 studio background
         img_rgb = bg_rgb[None, None, :].expand(height, width, 3).clone()
-        normals_img = torch.zeros((height, width, 3), dtype=torch.float32)
-        depth_img = torch.full((height, width), float("inf"), dtype=torch.float32)
-        pid_img = torch.full((height, width), -1, dtype=torch.long)
-        cap_img = torch.zeros((height, width), dtype=torch.bool)
+        normals_img = torch.zeros((height, width, 3), dtype=torch.float32, device=dev)
+        depth_img = torch.full((height, width), float("inf"), dtype=torch.float32, device=dev)
+        pid_img = torch.full((height, width), -1, dtype=torch.long, device=dev)
+        cap_img = torch.zeros((height, width), dtype=torch.bool, device=dev)
 
         h_idx = torch.nonzero(f_hit, as_tuple=False).squeeze(-1)
         if h_idx.numel() > 0:
@@ -484,9 +499,9 @@ def _render_parts_to_png(
 
             # Soft shadow march toward key light (12 steps)
             sh_o = hit_pts + max(0.05, 1.5 * pixel_world) * nrm
-            sh_t = torch.full((h_idx.numel(),), 0.5 * pixel_world, dtype=torch.float32)
-            sh_active = torch.ones((h_idx.numel(),), dtype=torch.bool)
-            shadow = torch.ones((h_idx.numel(),), dtype=torch.float32)
+            sh_t = torch.full((h_idx.numel(),), 0.5 * pixel_world, dtype=torch.float32, device=dev)
+            sh_active = torch.ones((h_idx.numel(),), dtype=torch.bool, device=dev)
+            shadow = torch.ones((h_idx.numel(),), dtype=torch.float32, device=dev)
             s_idx = torch.nonzero(sh_active, as_tuple=False).squeeze(-1)
             for _ in range(6):
                 if s_idx.numel() == 0:
@@ -503,10 +518,10 @@ def _render_parts_to_png(
                 s_idx = s_idx[keep_s]
                 sh_t[s_idx] = sh_t[s_idx] + torch.clamp(sd[keep_s], min=0.5 * pixel_world)
 
-            palette_t = torch.tensor([p.color for p in parts], dtype=torch.float32)
+            palette_t = torch.tensor([p.color for p in parts], dtype=torch.float32, device=dev)
             base_col = palette_t[hit_pid]
             # Distinct darker slate/warm tint on section-cut cap faces
-            cap_tint = 0.72 * base_col + 0.28 * torch.tensor([0.22, 0.26, 0.32], dtype=torch.float32)
+            cap_tint = 0.72 * base_col + 0.28 * torch.tensor([0.22, 0.26, 0.32], dtype=torch.float32, device=dev)
             base_col = torch.where(hit_cap[:, None], cap_tint, base_col)
 
             ndotl_k = torch.clamp(torch.sum(nrm * key_dir[None, :], dim=-1), 0.0, 1.0)
@@ -533,7 +548,7 @@ def _render_parts_to_png(
 
         # 4. Crisp screen-space technical CAD edge ink
         hit_2d = f_hit.reshape(height, width)
-        edge = torch.zeros((height, width), dtype=torch.bool)
+        edge = torch.zeros((height, width), dtype=torch.bool, device=dev)
         # Compare right & down neighbors
         for dy, dx_i in ((0, 1), (1, 0)):
             h0 = hit_2d[: height - dy, : width - dx_i]
@@ -551,7 +566,7 @@ def _render_parts_to_png(
             e = (both & (n_jump | d_jump | p_jump | c_jump)) | sil_jump
             edge[: height - dy, : width - dx_i] |= e
 
-        ink_col = torch.tensor([0.12, 0.16, 0.23], dtype=torch.float32)
+        ink_col = torch.tensor([0.12, 0.16, 0.23], dtype=torch.float32, device=dev)
         img_rgb = torch.where(edge[:, :, None], 0.45 * img_rgb + 0.55 * ink_col[None, None, :], img_rgb)
 
         out_png.parent.mkdir(parents=True, exist_ok=True)
@@ -570,9 +585,11 @@ def render_sdf_snapshot(
     width: int = 800,
     height: int = 600,
     color: str | None = None,
+    device: str | torch.device | None = None,
 ) -> pathlib.Path:
     """Render a Reify Node/Part or multi-part dict directly from SDF via Sphere Tracing."""
-    parts = _normalize_parts(obj, params=params, color=color)
+    dev = torch.device(device) if device is not None else get_compute_device(torch.float32)
+    parts = _normalize_parts(obj, params=params, color=color, device=dev)
     return _render_parts_to_png(
         parts,
         pathlib.Path(out_png),
@@ -581,6 +598,7 @@ def render_sdf_snapshot(
         display=display,
         width=width,
         height=height,
+        device=dev,
     )
 
 
@@ -594,11 +612,13 @@ def render_violation_overlay_png(
     camera: str = "iso",
     width: int = 800,
     height: int = 600,
+    device: str | torch.device | None = None,
 ) -> pathlib.Path:
     """Render pure-SDF violation overlay (blue part, orange obstacles, red witness spheres)."""
-    parts = _normalize_parts(part, params=params, color="#4a6fa5")
+    dev = torch.device(device) if device is not None else get_compute_device(torch.float32)
+    parts = _normalize_parts(part, params=params, color="#4a6fa5", device=dev)
     for idx, rule in enumerate(getattr(spec, "obstacles", []) or []):
-        obs_parts = _normalize_parts(rule.obstacle, params=params, color="#e67e22")
+        obs_parts = _normalize_parts(rule.obstacle, params=params, color="#e67e22", device=dev)
         for p in obs_parts:
             p.name = f"obstacle_{idx}"
         parts.extend(obs_parts)
@@ -607,7 +627,7 @@ def render_violation_overlay_png(
             from reify.units import mm
 
             sph = Transform(Sphere(mm(1.35)), translation=(mm(float(pt[0])), mm(float(pt[1])), mm(float(pt[2]))))
-            w_parts = _normalize_parts(sph, params=params, color="#e74c3c")
+            w_parts = _normalize_parts(sph, params=params, color="#e74c3c", device=dev)
             for p in w_parts:
                 p.name = f"witness_{idx}"
             parts.extend(w_parts)
@@ -619,4 +639,5 @@ def render_violation_overlay_png(
         camera=camera,
         width=width,
         height=height,
+        device=dev,
     )

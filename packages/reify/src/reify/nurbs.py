@@ -1002,7 +1002,7 @@ class LoftSketches(Node):
             else:
                 B = pts2.shape[0]
                 if not same_topo:
-                    idx = torch.linspace(0, pts2.shape[1] - 1, 48, dtype=torch.long)
+                    idx = torch.linspace(0, pts2.shape[1] - 1, 48, dtype=torch.long, device=device)
                     pts2 = pts2[:, idx, :]
                 zv = _val_mm_tensor(zq, params, dtype).to(device=device)
                 zv = (zv.expand(B) if zv.ndim == 0 else zv)[:, None, None].expand(B, pts2.shape[1], 1)

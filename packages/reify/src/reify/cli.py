@@ -15,6 +15,7 @@ import trimesh
 
 from reify.ast import Node, Part
 from reify.brep_compiler import compile_brep_error, export_step
+from reify.device import device_info
 from reify.cad_bridge import (
     get_certification_tier,
     lookup_reify_document,
@@ -151,6 +152,34 @@ def _cmd_run(argv: list[str]) -> int:
 def _cmd_snapshot(argv: list[str]) -> int:
     if len(argv) >= 2:
         src = argv[0]
+        if src.endswith(".py") and pathlib.Path(src).exists():
+            ap = argparse.ArgumentParser(prog="reify snapshot", add_help=False)
+            ap.add_argument("src", type=pathlib.Path)
+            ap.add_argument("out", type=pathlib.Path)
+            ap.add_argument("--target", default=None)
+            ap.add_argument("--params", default=None)
+            ap.add_argument("--camera", default="iso")
+            ap.add_argument("--display", default=None)
+            ap.add_argument("--width", type=int, default=800)
+            ap.add_argument("--height", type=int, default=600)
+            ap.add_argument("--device", default=None)
+            ns, unknown = ap.parse_known_args(argv)
+            if not unknown:
+                mod = _load_script_module(ns.src.resolve())
+                obj = _extract_target(mod, ns.target)
+                params = json.loads(ns.params) if ns.params else None
+                out_p = render_sdf_snapshot(
+                    obj,
+                    ns.out,
+                    params=params,
+                    camera=ns.camera,
+                    display=ns.display,
+                    width=ns.width,
+                    height=ns.height,
+                    device=ns.device,
+                )
+                print(f"wrote {out_p} ({ns.width}x{ns.height}, SDF sphere-trace)")
+                return 0
         if src.endswith(".glb") and pathlib.Path(src).exists():
             return _forward_cad(["glb", "snapshot", *argv])
         entry = lookup_reify_document(src)
@@ -258,9 +287,6 @@ def _cmd_export(argv: list[str]) -> int:
             dst_p = pathlib.Path(dst)
             if isinstance(obj, BRepFinalized):
                 rep = export_finalized_step(obj, dst_p)
-            elif isinstance(obj, dict):
-                print("STEP export of multi-part dict requires a single Part/Node root.", file=sys.stderr)
-                return 2
             else:
                 rep = export_step(obj, dst_p, params=params)
             if rep.status != Status.PASS:
@@ -412,6 +438,18 @@ def _cmd_viewer_sdf(argv: list[str]) -> int:
     return 0
 
 
+def _cmd_doctor(argv: list[str]) -> int:
+    from reify import __version__
+
+    info = {
+        "reify_version": __version__,
+        "compute_device": device_info(),
+    }
+    print(json.dumps(info, indent=2))
+    cad_args = [a for a in argv if a != "--quiet"]
+    return _run_cad_quiet(["doctor", *cad_args]) if "--quiet" in argv else _forward_cad(["doctor", *cad_args])
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if not args or args[0] in ("-h", "--help"):
@@ -419,8 +457,9 @@ def main(argv: list[str] | None = None) -> int:
             "Reify-CAD (Pure-SDF Primary Certified Parametric CAD CLI)\n\n"
             "Primary commands (pure-SDF hot loop):\n"
             "  reify server <start|status|stop>\n"
+            "  reify doctor\n"
             "  reify run <script.py>\n"
-            "  reify snapshot <id> <out.png> [flags...]\n"
+            "  reify snapshot <id|script.py> <out.png> [flags...]\n"
             "  reify inspect <id> [ref]\n"
             "  reify export <id> <out1> [out2...]   (.glb/.stl/.3mf via Manifold DC, .step via verified B-Rep)\n"
             "  reify certify <script.py> [--snapshot-dir DIR]\n"
@@ -437,6 +476,8 @@ def main(argv: list[str] | None = None) -> int:
 
         print(f"reify-cad {__version__}")
         return _forward_cad(["--version"])
+    if cmd == "doctor":
+        return _cmd_doctor(rest)
     if cmd == "server":
         return _forward_cad([cmd, *rest])
     if cmd == "run":

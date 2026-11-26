@@ -544,15 +544,93 @@ def extract_topology_invariants(shape: TopoDS_Shape) -> dict[str, Any]:
 
 
 def export_step(
-    part_or_node: Node | Part,
+    part_or_node: Node | Part | dict[str, Any],
     step_path: str | pathlib.Path,
     params: dict[str, Any] | None = None,
     craft_json_path: str | pathlib.Path | None = None,
     hausdorff_tol_mm: float = 1e-3,
     volume_rel_tol: float = 1e-4,
 ) -> VerificationReport:
-    """Export AST to STEP, re-import for round-trip verification, and optionally write craft JSON."""
+    """Export AST (or multi-part assembly dict) to STEP, re-import for round-trip verification, and optionally write craft JSON."""
+    from reify.finalize import BRepFinalized
     from reify.query import GeometryQuery
+
+    if isinstance(part_or_node, dict):
+        from OCP.BRep import BRep_Builder
+        from OCP.TopoDS import TopoDS_Compound
+
+        if not part_or_node:
+            return VerificationReport(status=Status.OUT_OF_DOMAIN, message="Empty assembly dict for STEP export.")
+        builder = BRep_Builder()
+        comp = TopoDS_Compound()
+        builder.MakeCompound(comp)
+        for name, item in part_or_node.items():
+            if isinstance(item, BRepFinalized):
+                shp = item.shape
+            else:
+                r_node = item.root if isinstance(item, Part) else item
+                if not r_node.is_brep_exportable():
+                    return VerificationReport(
+                        status=Status.OUT_OF_DOMAIN,
+                        message=f"Part {name!r} contains non-B-Rep-exportable implicit nodes; exact STEP export refused.",
+                    )
+                st, shp = compile_brep(r_node, params=params)
+                if st != Status.PASS or shp is None:
+                    return VerificationReport(
+                        status=Status.FAIL,
+                        reason=FailReason.TOPOLOGY_INVALID,
+                        message=f"B-Rep compilation failed for part {name!r}.",
+                    )
+            p_inv = extract_topology_invariants(shp)
+            if not p_inv["is_valid"] or p_inv["volume_mm3"] <= 1e-9:
+                return VerificationReport(
+                    status=Status.FAIL,
+                    reason=FailReason.TOPOLOGY_INVALID,
+                    metrics=p_inv,
+                    message=f"Compiled part {name!r} failed BRepCheck_Analyzer or has zero volume.",
+                )
+            builder.Add(comp, shp)
+
+        orig_inv = extract_topology_invariants(comp)
+        if not orig_inv["is_valid"] or orig_inv["volume_mm3"] <= 1e-9:
+            return VerificationReport(
+                status=Status.FAIL,
+                reason=FailReason.TOPOLOGY_INVALID,
+                metrics=orig_inv,
+                message="Assembled compound failed BRepCheck_Analyzer.",
+            )
+        step_file = pathlib.Path(step_path)
+        step_file.parent.mkdir(parents=True, exist_ok=True)
+        writer = STEPControl_Writer()
+        writer.Transfer(comp, STEPControl_AsIs)
+        if writer.Write(str(step_file)) != IFSelect_RetDone:
+            return VerificationReport(
+                status=Status.FAIL,
+                reason=FailReason.TOPOLOGY_INVALID,
+                message=f"Failed to write multi-part STEP file: {step_file}",
+            )
+        reader = STEPControl_Reader()
+        if reader.ReadFile(str(step_file)) != IFSelect_RetDone:
+            return VerificationReport(
+                status=Status.FAIL,
+                reason=FailReason.TOPOLOGY_INVALID,
+                message=f"Failed to re-import multi-part STEP file: {step_file}",
+            )
+        reader.TransferRoots()
+        re_inv = extract_topology_invariants(reader.OneShape())
+        vol_rel_err = abs(re_inv["volume_mm3"] - orig_inv["volume_mm3"]) / max(orig_inv["volume_mm3"], 1e-12)
+        if not re_inv["is_valid"] or re_inv["solids"] != orig_inv["solids"] or vol_rel_err > volume_rel_tol:
+            return VerificationReport(
+                status=Status.FAIL,
+                reason=FailReason.TOPOLOGY_INVALID,
+                metrics={"orig": orig_inv, "reimported": re_inv, "volume_rel_err": vol_rel_err},
+                message="Multi-part STEP round-trip topology or volume consistency check failed.",
+            )
+        return VerificationReport(
+            status=Status.PASS,
+            metrics={"topology": re_inv, "volume_rel_err": vol_rel_err},
+            message=f"Multi-part STEP export ({re_inv['solids']} solids) and round-trip verified.",
+        )
 
     part = part_or_node if isinstance(part_or_node, Part) else Part(root=part_or_node)
     root = part.root

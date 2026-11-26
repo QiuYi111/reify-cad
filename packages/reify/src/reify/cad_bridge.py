@@ -15,7 +15,7 @@ from typing import Any, Callable
 from reify.ast import Node, Part
 from reify.brep_compiler import compile_brep
 from reify.finalize import BRepFinalized
-from reify.sdf_mesh import export_sdf_glb, extract_sdf_mesh
+from reify.sdf_mesh import export_sdf_glb_with_stats, extract_sdf_mesh
 from reify.types import CertificationTier, Status, VerificationReport
 
 _PALETTE = ("#4a6fa5", "#5b8c5a", "#8e6c88", "#d4a373", "#3d5a80", "#e07a5f")
@@ -126,23 +126,10 @@ def register_sdf_document(
     stamp = hashlib.sha1(f"{name}:{time.time_ns()}".encode("utf-8")).hexdigest()[:10]
     glb_path = _DOCS_DIR / f"{name}_{stamp}.glb"
 
-    export_sdf_glb(obj, glb_path, params=params, color=color, resolution=resolution)
-
-    # Measure raw mesh stats without crease splitting
-    if isinstance(obj, dict):
-        verts = 0
-        faces = 0
-        watertight = True
-        for v in obj.values():
-            mv = extract_sdf_mesh(v, params=params, resolution=resolution, split_creases=False)
-            verts += len(mv.vertices)
-            faces += len(mv.faces)
-            watertight = watertight and bool(mv.is_watertight)
-    else:
-        mv = extract_sdf_mesh(obj, params=params, resolution=resolution, split_creases=False)
-        verts = len(mv.vertices)
-        faces = len(mv.faces)
-        watertight = bool(mv.is_watertight)
+    _, stats = export_sdf_glb_with_stats(obj, glb_path, params=params, color=color, resolution=resolution)
+    verts = int(stats["verts"])
+    faces = int(stats["faces"])
+    watertight = bool(stats["watertight"])
 
     _ensure_server_running()
     proc = subprocess.run(

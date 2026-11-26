@@ -889,10 +889,10 @@ class GeometryQuery:
         def _alt_proj(pa0: torch.Tensor, pb0: torch.Tensor, rounds: int = 8) -> tuple[torch.Tensor, torch.Tensor]:
             pa, pb = pa0.clone(), pb0.clone()
             for _ in range(rounds):
-                pa = self._project_to_implicit_surface(pb, params=params, steps=3)
-                pb = other._project_to_implicit_surface(pa, params=params, steps=3)
-            pa = self._project_to_implicit_surface(pb, params=params, steps=4)
-            pb = other._project_to_implicit_surface(pa, params=params, steps=4)
+                pa = self._project_to_implicit_surface(pb, params=params, steps=12)
+                pb = other._project_to_implicit_surface(pa, params=params, steps=12)
+            pa = self._project_to_implicit_surface(pb, params=params, steps=14)
+            pb = other._project_to_implicit_surface(pa, params=params, steps=14)
             return pa, pb
 
         box_a = self.root.local_bounds(params)
@@ -984,7 +984,7 @@ class GeometryQuery:
             L_other: float,
             max_waves: int = 60,
             batch_size: int = 32,
-        ) -> tuple[float, bool]:
+        ) -> tuple[float, bool, list[tuple[float, int, np.ndarray, np.ndarray]]]:
             nonlocal best_upper, best_wa, best_wb, pen_witness
             lo0 = np.array(box_own[0], dtype=np.float64)
             hi0 = np.array(box_own[1], dtype=np.float64)
@@ -1033,7 +1033,7 @@ class GeometryQuery:
                 if np.any(pen_mask):
                     pi = int(np.nonzero(pen_mask)[0][0])
                     pen_witness = (float(m[pi, 0]), float(m[pi, 1]), float(m[pi, 2]))
-                    return 0.0, True
+                    return 0.0, True, []
 
                 keep = (f_own - L_own * r <= 0.0) & ~((f_own + L_own * r < 0.0) & (f_oth - L_other * r > 0.0))
                 lb_c = np.maximum(0.0, f_oth / L_other - r)
@@ -1078,9 +1078,9 @@ class GeometryQuery:
                             seq += 1
 
             lb_out = pq[0][0] if pq else best_upper
-            return lb_out, False
+            return lb_out, False, pq
 
-        lb_b, pen = _bnb_3d(other, self, box_b, L_b, L_a)
+        lb_b, pen, pq_b = _bnb_3d(other, self, box_b, L_b, L_a)
         if pen and pen_witness is not None:
             return DistanceResult(
                 value=0.0,
@@ -1096,8 +1096,9 @@ class GeometryQuery:
             )
 
         min_lb = lb_b
+        pq_a: list[tuple[float, int, np.ndarray, np.ndarray]] = []
         if min_lb < best_upper - deflection:
-            lb_a, pen = _bnb_3d(self, other, box_a, L_a, L_b)
+            lb_a, pen, pq_a = _bnb_3d(self, other, box_a, L_a, L_b)
             if pen and pen_witness is not None:
                 return DistanceResult(
                     value=0.0,
@@ -1112,6 +1113,100 @@ class GeometryQuery:
                     is_done=True,
                 )
             min_lb = max(min_lb, lb_a)
+
+        # Stage 3: Sparse 6D pairing on surviving surface cells when both shapes are non-exact SDFs
+        if min_lb < best_upper - deflection and pq_a and pq_b:
+            top_a = heapq.nsmallest(24, pq_a)
+            top_b = heapq.nsmallest(24, pq_b)
+            pq6: list[tuple[float, int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+            seq6 = 0
+            for _, _, al, ah in top_a:
+                for _, _, bl, bh in top_b:
+                    gap = np.maximum(0.0, np.maximum(al - bh, bl - ah))
+                    bd = float(np.linalg.norm(gap))
+                    if bd < best_upper - deflection:
+                        heapq.heappush(pq6, (max(min_lb, bd), seq6, al, ah, bl, bh))
+                        seq6 += 1
+            for wave6 in range(40):
+                if not pq6 or pq6[0][0] >= best_upper - deflection:
+                    break
+                popped6: list[tuple[float, int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+                while pq6 and len(popped6) < 64:
+                    it = heapq.heappop(pq6)
+                    if it[0] >= best_upper - deflection:
+                        heapq.heappush(pq6, it)
+                        break
+                    popped6.append(it)
+                if not popped6:
+                    break
+                ca_lo_l, ca_hi_l, cb_lo_l, cb_hi_l = [], [], [], []
+                for _, _, al, ah, bl, bh in popped6:
+                    ea = ah - al
+                    eb = bh - bl
+                    if float(np.dot(ea, ea)) >= float(np.dot(eb, eb)):
+                        ax = int(np.argmax(ea))
+                        mid = 0.5 * (al[ax] + ah[ax])
+                        ah1 = ah.copy(); ah1[ax] = mid
+                        al2 = al.copy(); al2[ax] = mid
+                        ca_lo_l.extend([al, al2]); ca_hi_l.extend([ah1, ah])
+                        cb_lo_l.extend([bl, bl]); cb_hi_l.extend([bh, bh])
+                    else:
+                        ax = int(np.argmax(eb))
+                        mid = 0.5 * (bl[ax] + bh[ax])
+                        bh1 = bh.copy(); bh1[ax] = mid
+                        bl2 = bl.copy(); bl2[ax] = mid
+                        ca_lo_l.extend([al, al]); ca_hi_l.extend([ah, ah])
+                        cb_lo_l.extend([bl, bl2]); cb_hi_l.extend([bh1, bh])
+                ca_lo = np.stack(ca_lo_l, axis=0)
+                ca_hi = np.stack(ca_hi_l, axis=0)
+                cb_lo = np.stack(cb_lo_l, axis=0)
+                cb_hi = np.stack(cb_hi_l, axis=0)
+                ma6 = 0.5 * (ca_lo + ca_hi)
+                mb6 = 0.5 * (cb_lo + cb_hi)
+                ra6 = 0.5 * np.linalg.norm(ca_hi - ca_lo, axis=-1)
+                rb6 = 0.5 * np.linalg.norm(cb_hi - cb_lo, axis=-1)
+                bdist6 = np.linalg.norm(np.maximum(0.0, np.maximum(ca_lo - cb_hi, cb_lo - ca_hi)), axis=-1)
+                cdist6 = np.linalg.norm(ma6 - mb6, axis=-1) - ra6 - rb6
+                n6 = len(ma6)
+                pts6 = torch.from_numpy(np.vstack([ma6, mb6]))
+                with torch.no_grad():
+                    fa6 = self.eval_field(pts6, params=params, dtype=torch.float64).numpy()
+                    fb6 = other.eval_field(pts6, params=params, dtype=torch.float64).numpy()
+                fa_ma6, fa_mb6 = fa6[:n6], fa6[n6:]
+                fb_ma6, fb_mb6 = fb6[:n6], fb6[n6:]
+                keep6 = (
+                    (fa_ma6 - L_a * ra6 <= 0.0)
+                    & (fb_mb6 - L_b * rb6 <= 0.0)
+                )
+                lb6 = np.maximum.reduce([bdist6, cdist6, fa_mb6 / L_a - rb6, fb_ma6 / L_b - ra6])
+                keep6 &= lb6 < best_upper - deflection
+                idxs6 = np.nonzero(keep6)[0]
+                if len(idxs6) > 0:
+                    if wave6 % 4 == 0:
+                        bi6 = int(idxs6[np.argmin(lb6[idxs6])])
+                        pa_c, pb_c = _alt_proj(
+                            torch.tensor([ma6[bi6].tolist()], dtype=torch.float64),
+                            torch.tensor([mb6[bi6].tolist()], dtype=torch.float64),
+                            rounds=4,
+                        )
+                        with torch.no_grad():
+                            fac = abs(float(self.eval_field(pa_c, params=params, dtype=torch.float64)[0]))
+                            fbc = abs(float(other.eval_field(pb_c, params=params, dtype=torch.float64)[0]))
+                        if fac < 1e-4 and fbc < 1e-4:
+                            dc = float(torch.linalg.norm(pa_c[0] - pb_c[0]))
+                            if dc < best_upper:
+                                best_upper = dc
+                                best_wa = tuple(float(v) for v in pa_c[0].tolist())  # type: ignore[assignment]
+                                best_wb = tuple(float(v) for v in pb_c[0].tolist())  # type: ignore[assignment]
+                    for i6 in idxs6:
+                        lbi6 = float(lb6[i6])
+                        if lbi6 < best_upper - deflection:
+                            heapq.heappush(pq6, (lbi6, seq6, ca_lo[i6], ca_hi[i6], cb_lo[i6], cb_hi[i6]))
+                            seq6 += 1
+            if pq6:
+                min_lb = max(min_lb, pq6[0][0])
+            else:
+                min_lb = best_upper
 
         # Check containment / penetration at witness points
         wa_t = torch.tensor([list(best_wa)], dtype=torch.float64)

@@ -24,6 +24,7 @@ from reify.ast import (
     Union,
 )
 from reify.brep_compiler import compile_brep, export_step, extract_topology_invariants
+from reify.device import device_info, get_compute_device
 from reify.sdf_mesh import export_sdf_glb, extract_sdf_mesh
 from reify.sdf_renderer import render_sdf_snapshot, render_violation_overlay_png
 from reify.dfm import (
@@ -215,6 +216,7 @@ __all__ = [
     "compute_structural_thickness",
     "compute_tet_quality",
     "deg",
+    "device_info",
     "eval_fcm_displacement_2d",
     "export_calculix_inp",
     "export_finalized_step",
@@ -227,6 +229,7 @@ __all__ = [
     "fcm_solve_modal_2d",
     "fcm_verify_3level_gci",
     "finalize_brep",
+    "get_compute_device",
     "import_step_terminal",
     "mesh_brep_gmsh_channel_a",
     "mesh_implicit_isosurface_stuffing_channel_b",

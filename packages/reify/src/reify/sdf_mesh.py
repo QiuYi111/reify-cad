@@ -10,6 +10,7 @@ import torch
 import trimesh
 
 from reify.ast import Box, Cylinder, Intersect, Node, Part, SmoothUnion, Sphere, Subtract, Transform, Union, _val_mm_float
+from reify.device import get_compute_device
 from reify.features import CircularPattern, ExtrudeSketch, Frustum, LinearPattern, Offset, Shell, TaperedExtrude
 from reify.finalize import BRepFinalized
 from reify.types import VerificationReport
@@ -121,7 +122,7 @@ def _min_feature_scale(node: Node, params: dict[str, Any] | None = None) -> floa
     if isinstance(node, Frustum):
         rmin = min(_val_mm_float(node.r_bottom, params), _val_mm_float(node.r_top, params))
         rmax = max(_val_mm_float(node.r_bottom, params), _val_mm_float(node.r_top, params))
-        return min(max(2.0 * rmin, 1.5), 2.0 * rmax, _val_mm_float(node.height, params))
+        return min(2.0 * max(rmin, 0.8), 2.0 * rmax, _val_mm_float(node.height, params))
     if isinstance(node, Shell):
         return min(_val_mm_float(node.thickness, params), _min_feature_scale(node.child, params))
     if isinstance(node, (Offset, LinearPattern, CircularPattern)):
@@ -140,12 +141,14 @@ def _eval_sdf_batched(
     chunk_size: int = 65536,
 ) -> np.ndarray:
     """Evaluate SDF on (N, 3) numpy points in float32 chunks with no autograd overhead."""
+    dev = get_compute_device(torch.float32)
+    eff_chunk = 131072 if dev.type != "cpu" else chunk_size
     n = pts_np.shape[0]
     out = np.empty(n, dtype=np.float32)
     with torch.no_grad():
-        for start in range(0, n, chunk_size):
-            end = min(n, start + chunk_size)
-            t = torch.from_numpy(pts_np[start:end].astype(np.float32, copy=False))
+        for start in range(0, n, eff_chunk):
+            end = min(n, start + eff_chunk)
+            t = torch.from_numpy(pts_np[start:end].astype(np.float32, copy=False)).to(dev)
             vals = root.eval_sdf(t, params=params, dtype=torch.float32)
             if vals.ndim == 2:
                 vals = vals[0]
@@ -164,6 +167,8 @@ def _eval_grad_batched(
     m = pts_np.shape[0]
     if m == 0:
         return np.zeros((0, 3), dtype=np.float64)
+    dev = get_compute_device(torch.float32)
+    eff_chunk = 32768 if dev.type != "cpu" else chunk_size
     offsets = np.array(
         [
             [h_fd, 0.0, 0.0],
@@ -177,12 +182,12 @@ def _eval_grad_batched(
     )
     normals = np.empty((m, 3), dtype=np.float64)
     with torch.no_grad():
-        for start in range(0, m, chunk_size):
-            end = min(m, start + chunk_size)
+        for start in range(0, m, eff_chunk):
+            end = min(m, start + eff_chunk)
             sub = pts_np[start:end].astype(np.float32, copy=False)
             k = sub.shape[0]
             probe = (sub[:, None, :] + offsets[None, :, :]).reshape(-1, 3)
-            vals = root.eval_sdf(torch.from_numpy(probe), params=params, dtype=torch.float32)
+            vals = root.eval_sdf(torch.from_numpy(probe).to(dev), params=params, dtype=torch.float32)
             if vals.ndim == 2:
                 vals = vals[0]
             v = vals.detach().cpu().numpy().reshape(k, 6).astype(np.float64)
@@ -193,7 +198,11 @@ def _eval_grad_batched(
     return normals
 
 
-def _split_creases(mesh: trimesh.Trimesh, crease_angle_deg: float) -> trimesh.Trimesh:
+def _split_creases(
+    mesh: trimesh.Trimesh,
+    crease_angle_deg: float,
+    sdf_normals: np.ndarray | None = None,
+) -> trimesh.Trimesh:
     """Split vertices across sharp dihedral edges (> crease_angle_deg) for crisp CAD normals."""
     verts = mesh.vertices
     faces = mesh.faces
@@ -221,7 +230,7 @@ def _split_creases(mesh: trimesh.Trimesh, crease_angle_deg: float) -> trimesh.Tr
             fi = inc[0]
             new_vi = len(new_verts)
             new_verts.append(verts[vi])
-            new_normals.append(fnorm[fi])
+            new_normals.append(sdf_normals[vi] if sdf_normals is not None else fnorm[fi])
             for k in range(3):
                 if faces[fi, k] == vi:
                     new_faces[fi, k] = new_vi
@@ -247,18 +256,24 @@ def _split_creases(mesh: trimesh.Trimesh, crease_angle_deg: float) -> trimesh.Tr
         for ci, cl in enumerate(clusters):
             new_vi = len(new_verts)
             new_verts.append(verts[vi])
-            new_normals.append(cluster_norms[ci])
+            use_n = sdf_normals[vi] if (len(clusters) == 1 and sdf_normals is not None) else cluster_norms[ci]
+            new_normals.append(use_n)
             for fi in cl:
                 for k in range(3):
                     if faces[fi, k] == vi:
                         new_faces[fi, k] = new_vi
 
-    return trimesh.Trimesh(
+    out_mesh = trimesh.Trimesh(
         vertices=np.asarray(new_verts, dtype=np.float64),
         faces=new_faces,
         vertex_normals=np.asarray(new_normals, dtype=np.float64),
         process=False,
     )
+    if len(out_mesh.faces) > 0:
+        valid_f = out_mesh.area_faces > 1e-10
+        if not np.all(valid_f):
+            out_mesh.update_faces(valid_f)
+    return out_mesh
 
 
 def _tessellate_brep_finalized(obj: BRepFinalized, linear_deflection: float = 0.05) -> trimesh.Trimesh:
@@ -309,7 +324,7 @@ def extract_sdf_mesh(
     *,
     params: dict[str, Any] | None = None,
     resolution: int = 96,
-    crease_angle_deg: float = 28.0,
+    crease_angle_deg: float = 42.0,
     split_creases: bool = True,
 ) -> trimesh.Trimesh:
     """Extract a manifold, sharp-feature-preserving watertight mesh via Manifold Dual Contouring."""
@@ -329,7 +344,7 @@ def extract_sdf_mesh(
     # Adaptive multi-scale grid spacing: resolve small features (e.g. 1.8mm horns) cleanly
     r_min = max(0.5, _min_feature_scale(root, params))
     dx_base = max_ext / max(16, int(resolution))
-    dx = min(dx_base, max(r_min / 2.6, max_ext / 200.0))
+    dx = min(dx_base, max(r_min / 3.5, max_ext / 240.0))
 
     pad = 2.5 * dx
     origin = bmin - pad
@@ -513,6 +528,19 @@ def extract_sdf_mesh(
     pad_in = 0.04 * dx_vec[None, :]
     verts = np.clip(p_mean + delta, c_lo + pad_in, c_hi - pad_in)
 
+    # Smooth Rank-1 Isosurface Newton Polish: project smooth-surface vertices onto f(v)=0
+    # while leaving sharp-edge/corner vertices (rank >= 2) anchored at QEF intersections.
+    smooth_mask = np.sum(keep, axis=-1) == 1
+    if np.any(smooth_mask):
+        sv = verts[smooth_mask]
+        fv = _eval_sdf_batched(root, sv, params).astype(np.float64)
+        gv = _eval_grad_batched(root, sv, params, h_fd=max(1e-4, 0.04 * dx))
+        verts[smooth_mask] = np.clip(
+            sv - np.clip(fv, -0.35 * dx, 0.35 * dx)[:, None] * gv,
+            c_lo[smooth_mask] + pad_in,
+            c_hi[smooth_mask] - pad_in,
+        )
+
     # 5. Emit consistently oriented manifold quads with dihedral-optimal diagonal splitting
     tris: list[np.ndarray] = []
 
@@ -578,7 +606,8 @@ def extract_sdf_mesh(
     if len(mesh.faces) > 0 and mesh.volume < 0.0:
         mesh.invert()
     if split_creases and len(mesh.faces) > 0:
-        return _split_creases(mesh, crease_angle_deg)
+        sdf_nrms = _eval_grad_batched(root, mesh.vertices, params, h_fd=max(1e-4, 0.04 * dx))
+        return _split_creases(mesh, crease_angle_deg, sdf_normals=sdf_nrms)
     return mesh
 
 
@@ -606,6 +635,50 @@ def _make_colored_mesh(mesh: trimesh.Trimesh, hex_color: str) -> trimesh.Trimesh
     return mesh
 
 
+def export_sdf_glb_with_stats(
+    obj: Node | Part | BRepFinalized | dict[str, Node | Part | BRepFinalized],
+    glb_path: str | pathlib.Path,
+    *,
+    params: dict[str, Any] | None = None,
+    color: str | None = None,
+    resolution: int = 96,
+) -> tuple[pathlib.Path, dict[str, Any]]:
+    """Export Reify Node/Part/BRepFinalized or assembly dict to glTF 2.0 Y-up (.glb) and return raw mesh stats."""
+    out = pathlib.Path(glb_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    scene = trimesh.Scene()
+    items = obj.items() if isinstance(obj, dict) else [(obj.name if isinstance(obj, Part) else "part", obj)]
+    total_verts = 0
+    total_faces = 0
+    all_watertight = True
+    for idx, (name, item) in enumerate(items):
+        m_raw = extract_sdf_mesh(item, params=params, resolution=resolution, split_creases=False)
+        total_verts += len(m_raw.vertices)
+        total_faces += len(m_raw.faces)
+        all_watertight = all_watertight and bool(m_raw.is_watertight)
+        if len(m_raw.faces) > 0:
+            if isinstance(item, BRepFinalized):
+                m_vis = _split_creases(m_raw, 42.0)
+            else:
+                root_item = item.root if isinstance(item, Part) else item
+                bmin_t, bmax_t = root_item.local_bounds(params)
+                max_ext = float(np.max(np.maximum(np.asarray(bmax_t) - np.asarray(bmin_t), 1e-3)))
+                r_min = max(0.5, _min_feature_scale(root_item, params))
+                dx = min(max_ext / max(16, int(resolution)), max(r_min / 3.5, max_ext / 240.0))
+                sdf_nrms = _eval_grad_batched(root_item, m_raw.vertices, params, h_fd=max(1e-4, 0.04 * dx))
+                m_vis = _split_creases(m_raw, 42.0, sdf_normals=sdf_nrms)
+        else:
+            m_vis = m_raw
+        m_vis = _zup_to_gltf_yup(m_vis)
+        c = color or _PALETTE[idx % len(_PALETTE)]
+        _make_colored_mesh(m_vis, c)
+        scene.add_geometry(m_vis, node_name=str(name), geom_name=str(name))
+
+    scene.export(str(out))
+    return out, {"verts": total_verts, "faces": total_faces, "watertight": all_watertight}
+
+
 def export_sdf_glb(
     obj: Node | Part | BRepFinalized | dict[str, Node | Part | BRepFinalized],
     glb_path: str | pathlib.Path,
@@ -615,19 +688,7 @@ def export_sdf_glb(
     resolution: int = 96,
 ) -> pathlib.Path:
     """Export Reify Node/Part/BRepFinalized or assembly dict to glTF 2.0 Y-up (.glb) via Manifold DC."""
-    out = pathlib.Path(glb_path)
-    out.parent.mkdir(parents=True, exist_ok=True)
-
-    scene = trimesh.Scene()
-    items = obj.items() if isinstance(obj, dict) else [(obj.name if isinstance(obj, Part) else "part", obj)]
-    for idx, (name, item) in enumerate(items):
-        m = extract_sdf_mesh(item, params=params, resolution=resolution, split_creases=True)
-        m = _zup_to_gltf_yup(m)
-        c = color or _PALETTE[idx % len(_PALETTE)]
-        _make_colored_mesh(m, c)
-        scene.add_geometry(m, node_name=str(name), geom_name=str(name))
-
-    scene.export(str(out))
+    out, _ = export_sdf_glb_with_stats(obj, glb_path, params=params, color=color, resolution=resolution)
     return out
 
 

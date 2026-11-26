@@ -47,4 +47,5 @@
 - `reify viewer-sdf <script.py> [--out viewer.html]` compiles Class 1 AST directly to a **60fps WebGL2 GLSL SDF raymarching** HTML viewer (zero triangle meshes, live clip plane & overhang heatmap).
 - `reify export <id> out.glb/.stl/.3mf` uses **Manifold Dual Contouring** (Schaefer-Ju-Warren 2007 + SVD-QEF; `.glb` auto-converts Z-up → glTF Y-up).
 - `reify export <id> out.step` compiles and validates exact OCCT B-Rep (`BRepCheck_Analyzer` + `MAT2d` `MakeEvolved` + dual-backend Hausdorff check) on demand at export time.
-- Extra pure-SDF helpers: `check_draft_and_overhang(...)`, `wost_solve_point(...)` (Walk-on-Stars mixed Dirichlet+Neumann), `GeometryQuery.distance_query(...)` (Affine Arithmetic interval B&B).
+- Extra pure-SDF helpers: `check_draft_and_overhang(...)`, `wost_solve_point(...)` (Walk-on-Stars mixed Dirichlet+Neumann), `GeometryQuery.distance_query(...)` (Two-stage 3D+6D Lagrangian-Affine B&B), `get_compute_device(...)`, `device_info()`.
+- CLI utilities: `reify doctor` (CUDA/MPS/CPU & OCCT diagnostics), `reify snapshot <id|script.py> <out.png>`, `reify export <id> <out.step>` (supports single `Part` and multi-part `dict[str, Part]` assemblies), `reify viewer-sdf <script.py> --out viewer.html` (universal WebGL2 GLSL + `sampler3D` volume viewer).
