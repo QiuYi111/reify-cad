@@ -1,6 +1,6 @@
 [project]
 name = "reify"
-version = "0.1.0"
+version = "0.2.0"
 description = "Parametric geometry compilation, multi-start sizing solver, bounded kinematics/DFM/unfitted-physics verification, and verified STEP export for Engineering Agents."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
