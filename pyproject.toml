@@ -10,15 +10,17 @@
 # cad, the one distribution. Its aliases (packages/aliases) are not members: each pins cad at its own release,
 # cad-server carries a second `cad` command, nothing in development imports them, and the release builds each
 # alone with `python -m build`.
-members = ["packages/cad"]
+members = ["packages/cad", "packages/reify"]
 exclude = ["packages/aliases/*"]
 
 [tool.uv.sources]
 cad = { workspace = true }
+reify = { workspace = true }
 
 [dependency-groups]
 # What `uv sync` installs by default.
 dev = [
+  "reify",
   # The library editable, with its build123d extra: this environment runs models itself, so it is its own base
   # environment and the server makes none (cad_server/_internal/base.py). With its trimesh extra, so
   # `cad <type> dfm` measures a mesh here and the server makes no cad[trimesh] environment for it

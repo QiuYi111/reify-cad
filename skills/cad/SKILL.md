@@ -1,12 +1,14 @@
 ---
 name: cad
-description: Designs and edits 3D CAD - parametric parts, assemblies, mechanisms and 2D cut profiles, written as build123d Python and shown live in the text-to-cad viewer. Use for any request to model, change, measure, inspect, animate, export or convert a part or a CAD file (STEP, STL, 3MF, GLB, DXF, xbf), for references and Quick Edit prompts copied from the viewer, and to check whether a part can be machined, cut and bent, molded or printed. Not for robot descriptions, which the robot-simulation skill writes.
+description: Secondary compatibility fallback (`reify build123d`) for legacy raw build123d scripts, DXF cut profiles, and downstream fabrication tools. Prefer `skills/reify/SKILL.md` (`reify`) as the primary CAD modeling, certification, and autosize path.
 license: MIT
 metadata:
   repository: earthtojake/text-to-cad
 ---
 
-# CAD modeling and inspection
+> **Secondary Compatibility Path**: Use `skills/reify/SKILL.md` (`reify run / certify / autosize / snapshot / export`) as the primary CAD workflow. Use `cad` (`reify build123d ...`) only when working with raw/legacy `build123d` scripts or downstream tools.
+
+# CAD modeling and inspection (Secondary Compatibility)
 
 A model is a Python function that returns a build123d shape. Running its script builds it in
 text-to-cad's server, which holds the result as a document: the page the person has open follows

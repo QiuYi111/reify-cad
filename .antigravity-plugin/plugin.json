@@ -1,29 +1,27 @@
 {
-  "name": "text-to-cad",
-  "displayName": "text-to-cad",
+  "name": "reify-cad",
+  "displayName": "Reify CAD",
   "version": "0.11.17",
-  "description": "The text-to-cad plugin gives your agent local workflows for generating 3D models as STEP, GLB, STL or 3MF files. It also does design for manufacturing checks, generates engineering drawings, and connects to popular 3D printing, sheet metal and CNC fabrication services.",
+  "description": "Reify certified parametric CAD workbench for Engineering Agents: Class 1 sketches/splines/drafted shells/NURBS, multi-start autosize solve(), four-state clearance certification, headless multi-view snapshots, live Web 3D Viewer, and STEP/GLB/STL/3MF export.",
   "logo": ".claude-plugin/icon.png",
   "suggestedPrompts": [
-    "Design a 3D-printable phone stand for my desk.",
-    "Design a 50 mm aluminum L-bracket with two M5 holes.",
-    "Check my bracket for CNC machining and tell me what to change."
+    "Design a drafted open-top electronics enclosure with Reify and verify wall clearance.",
+    "Auto-size a spline cam bracket to clear a keep-out obstacle and export STEP + GLB.",
+    "Inspect my Reify assembly from iso, top, and cross-section views."
   ],
   "author": {
-    "name": "earthtojake",
-    "url": "https://github.com/earthtojake"
+    "name": "jingyi",
+    "url": "https://github.com/earthtojake/text-to-cad"
   },
-  "homepage": "https://www.texttocad.dev",
-  "repository": "https://github.com/earthtojake/text-to-cad",
   "license": "MIT",
   "keywords": [
+    "reify",
     "cad",
-    "robotics",
-    "fabrication",
-    "skills",
+    "parametric",
+    "nurbs",
+    "certification",
     "step",
-    "urdf",
-    "mujoco",
-    "gcode"
+    "glb",
+    "skills"
   ]
 }

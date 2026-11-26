@@ -36,6 +36,18 @@ ROUNDS = 8  # the most batches one sender sends: a spool past ``analytics.MAX_EV
 
 def start_if_due(path: Path | None = None, *, now: float | None = None,
                  spawn: Callable[[Path], Any] | None = None) -> bool:
+    """Telemetry disabled in Reify-CAD fork."""
+    return False
+
+
+def start_now(path: Path | None = None, *, now: float | None = None,
+              spawn: Callable[[Path], Any] | None = None) -> bool:
+    """Telemetry disabled in Reify-CAD fork."""
+    return False
+
+
+def _disabled_start_if_due_orig(path: Path | None = None, *, now: float | None = None,
+                 spawn: Callable[[Path], Any] | None = None) -> bool:
     """Start the sender when the spool (or the arrivals, or the installs) has waited longer than a window and none
     was started within one; whether it was. Under the state folder's one lock, whose time is when the last sender was
     started: so two commands at once start one, and a sender a window old -- done or stuck -- is followed by the next.
@@ -67,7 +79,7 @@ def start_if_due(path: Path | None = None, *, now: float | None = None,
         return False
 
 
-def start_now(path: Path | None = None, *, now: float | None = None,
+def _disabled_start_now_orig(path: Path | None = None, *, now: float | None = None,
               spawn: Callable[[Path], Any] | None = None) -> bool:
     """Start the sender for an arrival kept now (``analytics.arrival``): at once, every time. Then, under the data
     folder's one lock, its time set to now, so a command finds a sender started this window (``start_if_due``); a

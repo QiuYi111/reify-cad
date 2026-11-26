@@ -370,7 +370,12 @@ def _loaded_files(script: Path, heard: list[str]) -> list[str]:
         file = getattr(module, "__file__", None)
         if file:
             files.update((file, os.path.dirname(file)))
-        files.update(str(folder) for folder in getattr(module, "__path__", None) or ())
+        mod_path = getattr(module, "__path__", None)
+        if mod_path is not None:
+            try:
+                files.update(str(folder) for folder in mod_path)
+            except TypeError:
+                pass
     # A library's files are not the model's: a load never imports a library again (it stays in
     # ``sys.modules``), so what one reads at its import is no change a load would see.
     from cad.engine.kernel.trace import _library_roots
@@ -634,6 +639,15 @@ def _build(script: Path, functions: list[str] | None = None, *, log: Callable[[s
             _say("body", model)
             try:
                 result = context.root(model)
+                try:
+                    from reify.cad_bridge import is_reify_object, to_build123d_shape
+                except ImportError:
+                    _reify_src = str(Path(__file__).resolve().parents[4] / "reify" / "src")
+                    if _reify_src not in sys.path:
+                        sys.path.insert(0, _reify_src)
+                    from reify.cad_bridge import is_reify_object, to_build123d_shape
+                if is_reify_object(result):
+                    result = to_build123d_shape(result)
             except Exception as error:  # noqa: BLE001 - the model's own error, reported
                 reports.append({"ok": False, "model": f"{shown}::{model.name}", "id": model.id, **_failed(error)})
                 # A child that ran before the error writes its files all the same.
@@ -765,6 +779,15 @@ def preview(script: Path, name: str, values: dict[str, Any], *, cwd: Path | None
             raise BuildError(f"{shown} defines no model {name}")
         try:
             result = context.root(model)
+            try:
+                from reify.cad_bridge import is_reify_object, to_build123d_shape
+            except ImportError:
+                _reify_src = str(Path(__file__).resolve().parents[4] / "reify" / "src")
+                if _reify_src not in sys.path:
+                    sys.path.insert(0, _reify_src)
+                from reify.cad_bridge import is_reify_object, to_build123d_shape
+            if is_reify_object(result):
+                result = to_build123d_shape(result)
         except Exception as error:  # noqa: BLE001 - the model's own error at those values, answered
             return {"ok": False, "model": f"{shown}::{model.name}", **_failed(error)}, b""
         body = time.perf_counter()

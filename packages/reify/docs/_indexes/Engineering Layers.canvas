@@ -1,0 +1,15 @@
+{
+  "nodes": [
+    {"id":"need","type":"text","text":"# Why / Need\nStakeholder intent","x":0,"y":0,"width":300,"height":180},
+    {"id":"requirement","type":"text","text":"# What / Requirement\nVerifiable obligation","x":400,"y":0,"width":300,"height":180},
+    {"id":"design","type":"text","text":"# How / Decision + Design\nChosen realization","x":800,"y":0,"width":300,"height":180},
+    {"id":"activity","type":"text","text":"# Practice / Activity\nImplementation or verification","x":1200,"y":0,"width":300,"height":180},
+    {"id":"evidence","type":"text","text":"# Truth / Evidence\nObserved result","x":1600,"y":0,"width":300,"height":180}
+  ],
+  "edges": [
+    {"id":"e1","fromNode":"requirement","toNode":"need","label":"refines"},
+    {"id":"e2","fromNode":"design","toNode":"requirement","label":"realizes"},
+    {"id":"e3","fromNode":"activity","toNode":"design","label":"implements / evaluates"},
+    {"id":"e4","fromNode":"evidence","toNode":"activity","label":"produced_by"}
+  ]
+}

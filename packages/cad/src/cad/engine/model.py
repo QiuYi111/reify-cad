@@ -908,6 +908,19 @@ class BuildContext:
         finally:
             self.stack.pop()
         self.timings[model.identity] = self.timings.get(model.identity, 0.0) + time.perf_counter() - started
+        try:
+            from reify.cad_bridge import is_reify_object, to_build123d_shape
+        except ImportError:
+            _reify_src = Path(__file__).resolve().parents[4] / "reify" / "src"
+            if _reify_src.is_dir() and str(_reify_src) not in sys.path:
+                sys.path.insert(0, str(_reify_src))
+            try:
+                from reify.cad_bridge import is_reify_object, to_build123d_shape
+            except ImportError:
+                is_reify_object = None  # type: ignore[assignment]
+                to_build123d_shape = None  # type: ignore[assignment]
+        if is_reify_object is not None and is_reify_object(result):
+            result = to_build123d_shape(result, label=model.name)
         check_result(model, result)
         return result
 
