@@ -378,21 +378,21 @@ class Shell(Node):
         bmin, bmax = self.child.local_bounds(params)
         z_bot, z_top = bmin[2], bmax[2]
         if isinstance(self.child, TaperedExtrude):
-            # Evaluate drafted side + bottom cap without top cap so cavity opens cleanly at z_top
+            # Evaluate d2d ONCE and derive both outer and open-top inner cavity SDFs
             h_c = _val_mm_tensor(self.child.height, params, dtype).to(device=p.device)
             th_c = _val_rad_tensor(self.child.draft_angle, params, dtype).to(device=p.device)
             if (h_c.ndim == 1 or th_c.ndim == 1 or t.ndim == 1) and p.ndim == 2:
                 p = p.unsqueeze(0)
-                f_outer = self.child.eval_sdf(p, params=params, dtype=dtype)
             h_c = _match_pts_shape(h_c, p)
             th_c = _match_pts_shape(th_c, p)
             hz_c = 0.5 * h_c
             d2d = self.child.sketch.eval_sdf_2d(p[..., :2], params=params, dtype=dtype)
             if d2d.ndim == 1 and p.ndim == 3:
                 d2d = d2d.unsqueeze(0).expand(p.shape[0], -1)
-            d_side = d2d * torch.cos(th_c) + (p[..., 2] + hz_c) * torch.sin(th_c)
-            d_bot = -hz_c - p[..., 2]
-            f_inner_open = torch.maximum(d_side, d_bot)
+            pz = p[..., 2]
+            d_side = d2d * torch.cos(th_c) + (pz + hz_c) * torch.sin(th_c)
+            f_outer = torch.maximum(d_side, torch.abs(pz) - hz_c)
+            f_inner_open = torch.maximum(d_side, -hz_c - pz)
             t_b = _match_pts_shape(t, p) if f_outer.ndim == 2 else t
             return torch.maximum(f_outer, -(f_inner_open + t_b))
 

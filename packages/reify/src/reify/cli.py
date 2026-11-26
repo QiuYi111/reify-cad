@@ -21,7 +21,8 @@ from reify.cad_bridge import (
     register_sdf_document,
 )
 from reify.finalize import BRepFinalized, export_finalized_step, verify_brep_clearance
-from reify.sdf_mesh import export_sdf_glb, export_violation_overlay_glb, extract_sdf_mesh
+from reify.sdf_mesh import extract_sdf_mesh
+from reify.sdf_renderer import render_sdf_snapshot, render_violation_overlay_png
 from reify.solve import SolveStatus, solve
 from reify.spec import Spec
 from reify.types import CertificationTier, Status
@@ -102,19 +103,24 @@ def _extract_params_list(mod: Any, var_name: str | None) -> list[Any]:
     raise RuntimeError("No params_list found; define PARAMS / build_params() or pass --params-list NAME")
 
 
-def _snapshot_glb_views(glb_path: pathlib.Path, out_dir: pathlib.Path) -> list[str]:
+def _snapshot_sdf_views(
+    obj: Any,
+    out_dir: pathlib.Path,
+    *,
+    params: dict[str, Any] | None = None,
+) -> list[str]:
     out_dir.mkdir(parents=True, exist_ok=True)
     views = [
-        ("iso.png", []),
-        ("top.png", ["--camera", "top"]),
-        ("front.png", ["--camera", "front"]),
-        ("section.png", ["--display", '{"clip":{"enabled":true,"axis":"z","at":0.0}}']),
+        ("iso.png", "iso", None),
+        ("top.png", "top", None),
+        ("front.png", "front", None),
+        ("section.png", "iso", {"clip": {"enabled": True, "axis": "z", "at": 0.0}}),
     ]
     written = []
-    for fname, extra in views:
+    for fname, cam, disp in views:
         out_p = out_dir / fname
-        rc = _run_cad_quiet(["glb", "snapshot", str(glb_path), str(out_p), *extra])
-        if rc == 0 and out_p.exists():
+        render_sdf_snapshot(obj, out_p, params=params, camera=cam, display=disp)
+        if out_p.exists():
             written.append(str(out_p))
     return written
 
@@ -148,6 +154,35 @@ def _cmd_snapshot(argv: list[str]) -> int:
             return _forward_cad(["glb", "snapshot", *argv])
         entry = lookup_reify_document(src)
         if entry is not None:
+            legacy_flags = ("--job", "--annotation", "--measurements", "--pose", "--preview")
+            if entry.get("script") and pathlib.Path(entry["script"]).exists() and not any(
+                a in legacy_flags for a in argv[2:]
+            ):
+                ap = argparse.ArgumentParser(prog="reify snapshot", add_help=False)
+                ap.add_argument("src")
+                ap.add_argument("out", type=pathlib.Path)
+                ap.add_argument("--camera", default="iso")
+                ap.add_argument("--display", default=None)
+                ap.add_argument("--width", type=int, default=800)
+                ap.add_argument("--height", type=int, default=600)
+                ns, unknown = ap.parse_known_args(argv)
+                if not unknown:
+                    mod = _load_script_module(pathlib.Path(entry["script"]))
+                    obj = _extract_target(mod, entry.get("target"))
+                    try:
+                        out_p = render_sdf_snapshot(
+                            obj,
+                            ns.out,
+                            params=entry.get("params"),
+                            camera=ns.camera,
+                            display=ns.display,
+                            width=ns.width,
+                            height=ns.height,
+                        )
+                        print(f"wrote {out_p} ({ns.width}x{ns.height}, SDF sphere-trace)")
+                        return 0
+                    except NotImplementedError:
+                        pass
             return _forward_cad(["glb", "snapshot", entry["glb"], *argv[1:]])
     return _forward_cad(["model", "snapshot", *argv])
 
@@ -284,15 +319,12 @@ def _cmd_certify(argv: list[str]) -> int:
     if ns.snapshot_dir is not None:
         ns.snapshot_dir.mkdir(parents=True, exist_ok=True)
         if rep.status != Status.PASS:
-            ov_glb = ns.snapshot_dir / "violation_overlay.glb"
             ov_png = ns.snapshot_dir / "violation_overlay.png"
-            export_violation_overlay_glb(obj, spec_obj, rep, ov_glb, params=params)
-            if _run_cad_quiet(["glb", "snapshot", str(ov_glb), str(ov_png)]) == 0 and ov_png.exists():
+            render_violation_overlay_png(obj, spec_obj, rep, ov_png, params=params)
+            if ov_png.exists():
                 snapshots.append(str(ov_png))
         else:
-            cert_glb = ns.snapshot_dir / "certified.glb"
-            export_sdf_glb(obj, cert_glb, params=params)
-            snapshots.extend(_snapshot_glb_views(cert_glb, ns.snapshot_dir))
+            snapshots.extend(_snapshot_sdf_views(obj, ns.snapshot_dir, params=params))
 
     out = {
         "status": rep.status.value,
@@ -345,7 +377,7 @@ def _cmd_autosize(argv: list[str]) -> int:
         doc_id = doc.id
         view_url = doc.url
         if ns.snapshot_dir is not None:
-            snapshots = _snapshot_glb_views(doc.glb_path, ns.snapshot_dir)
+            snapshots = _snapshot_sdf_views(obj, ns.snapshot_dir, params=res.params)
 
     out = {
         "status": res.status.value,

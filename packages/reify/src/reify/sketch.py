@@ -854,11 +854,16 @@ class Loop2D:
     def rounded_rect(
         cls, lx: Quantity | Param, ly: Quantity | Param, fillet_r: Quantity | Param
     ) -> Loop2D:
-        hx = 0.5 * _val_mm_float(require_length(lx, "lx"), None)
-        hy = 0.5 * _val_mm_float(require_length(ly, "ly"), None)
-        r = _val_mm_float(require_length(fillet_r, "fillet_r"), None)
+        lx_q = require_length(lx, "lx")
+        ly_q = require_length(ly, "ly")
+        r_q = require_length(fillet_r, "fillet_r")
+        hx = 0.5 * _val_mm_float(lx_q, None)
+        hy = 0.5 * _val_mm_float(ly_q, None)
+        r = _val_mm_float(r_q, None)
         if r <= 1e-9:
-            return cls.polygon([(mm(hx), mm(-hy)), (mm(hx), mm(hy)), (mm(-hx), mm(hy)), (mm(-hx), mm(-hy))])
+            loop = cls.polygon([(mm(hx), mm(-hy)), (mm(hx), mm(hy)), (mm(-hx), mm(hy)), (mm(-hx), mm(-hy))])
+            loop._analytic_rounded_rect = (lx_q, ly_q, r_q)  # type: ignore[attr-defined]
+            return loop
         ix, iy = hx - r, hy - r
         segs: list[Segment2D] = []
         if iy > 1e-9:
@@ -873,7 +878,9 @@ class Loop2D:
         if ix > 1e-9:
             segs.append(LineSeg2D((mm(-ix), mm(-hy)), (mm(ix), mm(-hy))))
         segs.append(Arc2D((mm(ix), mm(-iy)), mm(r), deg(270.0), deg(360.0)))
-        return cls(segs)
+        loop = cls(segs)
+        loop._analytic_rounded_rect = (lx_q, ly_q, r_q)  # type: ignore[attr-defined]
+        return loop
 
     @classmethod
     def polygon(
@@ -1000,6 +1007,26 @@ class Loop2D:
     def eval_sdf_2d(
         self, pts_2d: torch.Tensor, params: dict[str, Any] | None = None, dtype: torch.dtype = torch.float64
     ) -> torch.Tensor:
+        ar = getattr(self, "_analytic_rounded_rect", None)
+        if ar is not None:
+            from reify.ast import _match_pts_shape
+
+            lx_q, ly_q, r_q = ar
+            p = pts_2d.to(dtype=dtype)
+            hx = 0.5 * _val_mm_tensor(lx_q, params, dtype).to(device=p.device)
+            hy = 0.5 * _val_mm_tensor(ly_q, params, dtype).to(device=p.device)
+            r = _val_mm_tensor(r_q, params, dtype).to(device=p.device)
+            if (hx.ndim == 1 or hy.ndim == 1 or r.ndim == 1) and p.ndim == 2:
+                p = p.unsqueeze(0)
+            hx = _match_pts_shape(hx, p)
+            hy = _match_pts_shape(hy, p)
+            r = _match_pts_shape(r, p)
+            qx = torch.abs(p[..., 0]) - (hx - r)
+            qy = torch.abs(p[..., 1]) - (hy - r)
+            out_d = torch.sqrt(torch.clamp(qx, min=0.0) ** 2 + torch.clamp(qy, min=0.0) ** 2 + 1e-30)
+            in_d = torch.clamp(torch.maximum(qx, qy), max=0.0)
+            return out_d + in_d - r
+
         seg_dists = [seg.eval_unsigned_distance(pts_2d, params=params, dtype=dtype) for seg in self.segments]
         if any(d.ndim == 2 for d in seg_dists):
             B = next(d.shape[0] for d in seg_dists if d.ndim == 2)

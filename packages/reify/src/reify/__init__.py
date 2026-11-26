@@ -25,6 +25,7 @@ from reify.ast import (
 )
 from reify.brep_compiler import compile_brep, export_step, extract_topology_invariants
 from reify.sdf_mesh import export_sdf_glb, extract_sdf_mesh
+from reify.sdf_renderer import render_sdf_snapshot, render_violation_overlay_png
 from reify.dfm import (
     brute_force_binary_morphology,
     check_directional_wall_thickness,
@@ -225,6 +226,8 @@ __all__ = [
     "mm",
     "mpm_solve_quasistatic_2d",
     "rad",
+    "render_sdf_snapshot",
+    "render_violation_overlay_png",
     "run_calculix_or_conformal_fem",
     "solve",
     "verify",

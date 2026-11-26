@@ -100,3 +100,24 @@ def test_reify_cad_pure_sdf_implicit_loop(tmp_path: pathlib.Path) -> None:
     _run(["export", doc_id, str(glb_out), str(stl_out)])
     assert glb_out.exists() and glb_out.stat().st_size > 500
     assert stl_out.exists() and stl_out.stat().st_size > 500
+
+
+def test_reify_cad_sdf_sphere_trace_multiscale(tmp_path: pathlib.Path) -> None:
+    """Verify native SDF Sphere Tracing on multiscale assembly (1.8mm Frustum horn + Cylinder ear + SmoothUnion) with zero GLB."""
+    from reify import Box, Cylinder, Frustum, Part, SmoothUnion, Sphere, Transform, Union, deg, mm
+    from reify.sdf_renderer import render_sdf_snapshot
+
+    body = Union([
+        SmoothUnion(Box(mm(40), mm(24), mm(20)), Transform(Sphere(mm(11)), translation=(mm(-20), mm(0), mm(6))), k=mm(2.5)),
+        Transform(Frustum(mm(4.6), mm(1.8), mm(24)), translation=(mm(14), mm(7), mm(20)), rotation_deg=(deg(-30), deg(8), deg(0))),
+        Transform(Cylinder(mm(3.5), mm(16)), translation=(mm(8), mm(6), mm(17)), rotation_deg=(deg(-14), deg(10), deg(0))),
+    ])
+    assy = {"body": Part(body, name="body"), "cap": Part(Transform(Box(mm(16), mm(12), mm(4)), translation=(mm(0), mm(0), mm(12))), name="cap")}
+
+    iso_png = tmp_path / "iso.png"
+    sec_png = tmp_path / "section.png"
+    render_sdf_snapshot(assy, iso_png, camera="iso", width=640, height=480)
+    render_sdf_snapshot(assy, sec_png, camera="iso", display={"clip": {"enabled": True, "axis": "y", "at": 0.0}}, width=640, height=480)
+    assert iso_png.exists() and iso_png.stat().st_size > 2000
+    assert sec_png.exists() and sec_png.stat().st_size > 2000
+    assert list(tmp_path.glob("*.glb")) == []
