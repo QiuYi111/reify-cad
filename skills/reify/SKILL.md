@@ -23,7 +23,7 @@ Reify is the primary CAD path. Write models using **Class 1 (`CORE_CERTIFIED`)**
    ```bash
    reify snapshot "$ID" tmp/iso.png
    reify snapshot "$ID" tmp/top.png --camera top
-   reify snapshot "$ID" tmp/section.png --display '{"clip":{"enabled":true,"axis":"z","offset":0.0}}'
+   reify snapshot "$ID" tmp/section.png --display '{"clip":{"enabled":true,"axis":"z","at":0.0}}'
    ```
 4. **Certify clearances & freezes (`PASS / FAIL / UNKNOWN`)**:
    ```bash
@@ -45,3 +45,28 @@ Reify is the primary CAD path. Write models using **Class 1 (`CORE_CERTIFIED`)**
 - **Default to Class 1 (`CORE_CERTIFIED`)**: Keep the entire parametric tree inside Reify Class 1 so `autosize` gradients, interval lower bounds, and `certify` stay intact.
 - **Irreversible terminal escape hatch (`BREP_ESCAPED`)**: Only call `finalize_brep(..., irreversible=True, reason="...")` at the very end for local edge fillets/chamfers or external STEP imports when Class 1 cannot express them. Never pass `BRepFinalized` back into AST operators or `solve()`.
 - **Secondary fallback**: Use `reify build123d <subcommand>` (`skills/cad/SKILL.md`) only for legacy `build123d` scripts or workflows not yet wrapped in Reify.
+
+## Minimal `@reify_model` Template
+
+```python
+from reify import Box, ClearanceRule, Loop2D, Param, Part, Shell, Sketch2D, Spec, TaperedExtrude, Transform, deg, mm
+from reify.cad_bridge import reify_model
+
+DRAFT = Param("draft_deg", 1.0, 0.5, 12.0, "deg")
+PARAMS = [DRAFT]
+
+def build_part() -> Part:
+    body = TaperedExtrude(Sketch2D(Loop2D.rounded_rect(mm(36), mm(36), mm(5))), height=mm(16), draft_angle=DRAFT)
+    return Part(root=Shell(body, thickness=mm(2.5), open_top=True), name="enclosure")
+
+def build_spec() -> Spec:
+    obs = Transform(Box(mm(6), mm(12), mm(8)), translation=(mm(20.5), mm(0), mm(6)))
+    return Spec(obstacles=[ClearanceRule(obstacle=obs, min_clearance_mm=1.0)])
+
+@reify_model(name="enclosure")
+def enclosure_model() -> Part:
+    return build_part()
+
+if __name__ == "__main__":
+    enclosure_model()
+```
